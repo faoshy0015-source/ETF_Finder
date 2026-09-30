@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import sqlite3
 import pandas as pd
 from datetime import datetime
 
@@ -56,13 +57,14 @@ HOLDING_COLUMNS=['etf_code','holding_code','holding_name','weight','quantity','a
 
 from datetime import timedelta
 from pathlib import Path
-import json, time
+import json, time, inspect
 
 DATA_DIR=Path(__file__).resolve().parent/'data'
 DATA_DIR.mkdir(exist_ok=True)
 MASTER_FILE=DATA_DIR/'etf_master.csv'
 HOLDINGS_FILE=DATA_DIR/'etf_holdings.csv'
 STATUS_FILE=DATA_DIR/'collection_status.json'
+DB_FILE=DATA_DIR/'etf_finder.db'
 
 def _secret_or_env(name):
     try:
@@ -119,226 +121,592 @@ def _num(v):
     try: return float(str(v).replace(',','').replace('%','').strip())
     except Exception: return None
 
+
+def _get_etf_pdf(stock, ticker, asof):
+    """Installed pykrx signature에 맞춰 ETF PDF를 안전하게 호출."""
+    fn = stock.get_etf_portfolio_deposit_file
+    try:
+        params = list(inspect.signature(fn).parameters.keys())
+    except Exception:
+        params = []
+
+    if params:
+        first = params[0].lower()
+        if "date" in first or first in ("fromdate", "trddate"):
+            return fn(asof, ticker)
+        if "ticker" in first or "code" in first:
+            return fn(ticker, asof)
+
+    errors = []
+    for args in ((asof, ticker), (ticker, asof)):
+        try:
+            df = fn(*args)
+            if df is not None and not df.empty:
+                return df
+            errors.append(f"{args}: 빈 DataFrame")
+        except Exception as e:
+            errors.append(f"{args}: {e}")
+    raise RuntimeError("ETF PDF 조회 실패 · " + " | ".join(errors))
+
 def collect_krx_etf_snapshot(progress=None,pause=0.05):
-    stock,collector_mode=_import_pykrx(); asof,tickers=_find_latest_market_date(stock)
+    stock,collector_mode=_import_pykrx()
+    asof,tickers=_find_latest_market_date(stock)
     collected_at=datetime.now().isoformat(timespec='seconds')
     master_rows=[]; holding_rows=[]; failures=[]
-    try: ohlcv=stock.get_etf_ohlcv_by_ticker(asof)
-    except Exception: ohlcv=pd.DataFrame()
+    try:
+        ohlcv=stock.get_etf_ohlcv_by_ticker(asof)
+    except Exception:
+        ohlcv=pd.DataFrame()
+
     total=len(tickers)
+    consecutive_failures=0
+    fail_fast_limit=5
+
     for i,ticker in enumerate(tickers,1):
         ticker=str(ticker).zfill(6)
         try:
             name=stock.get_etf_ticker_name(ticker) or ticker
             turnover=None
-            if not ohlcv.empty and ticker in ohlcv.index and '거래대금' in ohlcv.columns: turnover=_num(ohlcv.loc[ticker,'거래대금'])
-            pdf=stock.get_etf_portfolio_deposit_file(asof,ticker)
-            if pdf is None or pdf.empty: raise RuntimeError('PDF 구성종목이 비어 있음')
+            if not ohlcv.empty and ticker in ohlcv.index and '거래대금' in ohlcv.columns:
+                turnover=_num(ohlcv.loc[ticker,'거래대금'])
+
+            pdf=_get_etf_pdf(stock,ticker,asof)
+            if pdf is None or pdf.empty:
+                raise RuntimeError('PDF 구성종목이 비어 있음')
+
             d=pdf.reset_index().copy()
-            code_col=_pick_col(d,['티커','ticker','종목코드','index']) or d.columns[0]
-            name_col=_pick_col(d,['종목명','name']); weight_col=_pick_col(d,['비중','비중(%)','weight'])
-            qty_col=_pick_col(d,['계약수','수량','quantity']); amount_col=_pick_col(d,['금액','평가금액','amount'])
+            code_col=_pick_col(d,['티커','ticker','종목코드','구성종목코드','index']) or d.columns[0]
+            name_col=_pick_col(d,['구성종목명','종목명','name'])
+            weight_col=_pick_col(d,['비중','비중(%)','weight'])
+            qty_col=_pick_col(d,['계약수','수량','quantity'])
+            amount_col=_pick_col(d,['금액','평가금액','amount'])
+
             amounts=pd.to_numeric(d[amount_col],errors='coerce') if amount_col else None
             amount_total=float(amounts.fillna(0).sum()) if amounts is not None else 0.0
             valid=0
+
             for _,row in d.iterrows():
                 hcode=str(row.get(code_col,'')).strip()
-                if hcode.endswith('.0'): hcode=hcode[:-2]
-                if hcode.isdigit() and len(hcode)<=6: hcode=hcode.zfill(6)
+                if hcode.endswith('.0'):
+                    hcode=hcode[:-2]
+                if hcode.isdigit() and len(hcode)<=6:
+                    hcode=hcode.zfill(6)
+
                 hname=str(row.get(name_col,'')).strip() if name_col else ''
                 if not hname and hcode.isdigit() and len(hcode)==6:
-                    try: hname=stock.get_market_ticker_name(hcode) or hcode
-                    except Exception: hname=hcode
-                if not hname: hname=hcode or '기타자산'
+                    try:
+                        hname=stock.get_market_ticker_name(hcode) or hcode
+                    except Exception:
+                        hname=hcode
+                if not hname:
+                    hname=hcode or '기타자산'
+
                 w=_num(row.get(weight_col)) if weight_col else None
-                if w is None and amount_col and amount_total>0: w=(_num(row.get(amount_col)) or 0.0)/amount_total*100.0
+                if w is None and amount_col and amount_total>0:
+                    w=(_num(row.get(amount_col)) or 0.0)/amount_total*100.0
                 q=_num(row.get(qty_col)) if qty_col else None
-                holding_rows.append({'etf_code':ticker,'holding_code':hcode,'holding_name':hname,'weight':round(float(w or 0),6),'quantity':q,'as_of':asof,'source':'KRX PDF (Portfolio Deposit File)','collected_at':collected_at}); valid+=1
-            if not valid: raise RuntimeError('유효 구성종목 없음')
-            master_rows.append({'etf_code':ticker,'etf_name':name,'issuer':'','asset_region':'','asset_class':'','sector':'','subsector':'','aum':None,'turnover':turnover,'fee':None,'index_name':'','as_of':asof,'source':'KRX Data Marketplace','collected_at':collected_at})
-        except Exception as e: failures.append({'etf_code':ticker,'error':str(e)[:300]})
-        if progress: progress(i,total,ticker,len(failures))
-        if pause: time.sleep(pause)
-    master=pd.DataFrame(master_rows,columns=ETF_COLUMNS); holdings=pd.DataFrame(holding_rows,columns=HOLDING_COLUMNS)
-    if master.empty or holdings.empty: raise RuntimeError('수집 결과가 비어 있어 기존 DB를 변경하지 않았습니다.')
-    mt=MASTER_FILE.with_suffix('.tmp'); ht=HOLDINGS_FILE.with_suffix('.tmp')
-    master.to_csv(mt,index=False,encoding='utf-8-sig'); holdings.to_csv(ht,index=False,encoding='utf-8-sig'); mt.replace(MASTER_FILE); ht.replace(HOLDINGS_FILE)
-    status={'as_of':asof,'collected_at':collected_at,'total_etfs':total,'success_etfs':len(master),'failed_etfs':len(failures),'holding_rows':len(holdings),'failures':failures,'source':f'KRX Data Marketplace / PDF (Portfolio Deposit File) · {collector_mode}'}
-    STATUS_FILE.write_text(json.dumps(status,ensure_ascii=False,indent=2),encoding='utf-8')
+
+                holding_rows.append({
+                    'etf_code':ticker,'holding_code':hcode,'holding_name':hname,
+                    'weight':round(float(w or 0),6),'quantity':q,'as_of':asof,
+                    'source':'KRX PDF (Portfolio Deposit File)',
+                    'collected_at':collected_at
+                })
+                valid+=1
+
+            if not valid:
+                raise RuntimeError('유효 구성종목 없음')
+
+            master_rows.append({
+                'etf_code':ticker,'etf_name':name,'issuer':'',
+                'asset_region':'','asset_class':'','sector':'','subsector':'',
+                'aum':None,'turnover':turnover,'fee':None,'index_name':'',
+                'as_of':asof,'source':'KRX Data Marketplace',
+                'collected_at':collected_at
+            })
+            consecutive_failures=0
+
+        except Exception as e:
+            failures.append({'etf_code':ticker,'error':str(e)[:600]})
+            consecutive_failures+=1
+            if not master_rows and consecutive_failures>=fail_fast_limit:
+                if progress:
+                    progress(i,total,ticker,len(failures))
+                sample=' / '.join(
+                    f"{x['etf_code']}: {x['error']}" for x in failures[-3:]
+                )
+                raise RuntimeError(
+                    f'ETF 목록 {total:,}개는 조회됐지만 구성종목 조회가 '
+                    f'연속 {fail_fast_limit}건 실패해 중단했습니다. 최근 오류: {sample}'
+                )
+
+        if progress:
+            progress(i,total,ticker,len(failures))
+        if pause:
+            time.sleep(pause)
+
+    master=pd.DataFrame(master_rows,columns=ETF_COLUMNS)
+    holdings=pd.DataFrame(holding_rows,columns=HOLDING_COLUMNS)
+
+    if master.empty or holdings.empty:
+        raise RuntimeError('수집 결과가 비어 있어 기존 DB를 변경하지 않았습니다.')
+
+    mt=MASTER_FILE.with_suffix('.tmp')
+    ht=HOLDINGS_FILE.with_suffix('.tmp')
+    master.to_csv(mt,index=False,encoding='utf-8-sig')
+    holdings.to_csv(ht,index=False,encoding='utf-8-sig')
+    mt.replace(MASTER_FILE)
+    ht.replace(HOLDINGS_FILE)
+
+    status={
+        'as_of':asof,'collected_at':collected_at,'total_etfs':total,
+        'success_etfs':len(master),'failed_etfs':len(failures),
+        'holding_rows':len(holdings),'failures':failures,
+        'source':f'KRX Data Marketplace / PDF (Portfolio Deposit File) · {collector_mode}'
+    }
+    STATUS_FILE.write_text(
+        json.dumps(status,ensure_ascii=False,indent=2),encoding='utf-8'
+    )
     return master,holdings,status
 
+
 def load_snapshot():
+    '''기존 CSV 스냅샷 호환용.'''
     master=pd.read_csv(MASTER_FILE,dtype={'etf_code':str}) if MASTER_FILE.exists() else pd.DataFrame(columns=ETF_COLUMNS)
     holdings=pd.read_csv(HOLDINGS_FILE,dtype={'etf_code':str,'holding_code':str}) if HOLDINGS_FILE.exists() else pd.DataFrame(columns=HOLDING_COLUMNS)
     status=json.loads(STATUS_FILE.read_text(encoding='utf-8')) if STATUS_FILE.exists() else {}
     for df in (master,holdings):
-        if 'etf_code' in df: df['etf_code']=df['etf_code'].astype(str).str.zfill(6)
-    if 'holding_code' in holdings: holdings['holding_code']=holdings['holding_code'].fillna('').astype(str)
+        if 'etf_code' in df:
+            df['etf_code']=df['etf_code'].astype(str).str.zfill(6)
+    if 'holding_code' in holdings:
+        holdings['holding_code']=holdings['holding_code'].fillna('').astype(str)
     return master,holdings,status
 
 
-if 'etf_master' not in st.session_state or 'etf_holdings' not in st.session_state:
-    _m,_h,_status=load_snapshot()
-    st.session_state.etf_master=_m
-    st.session_state.etf_holdings=_h
-    st.session_state.collection_status=_status
+# =========================================================
+# LOCAL SQLITE DB
+# =========================================================
 
-st.subheader('🔐 KRX 데이터 로그인')
-st.caption('KRX ETF/PDF 실데이터 수집용 로그인입니다. 최신 pykrx가 이 ID/PW로 KRX 로그인 세션을 자동 관리합니다.')
-_c1,_c2=st.columns(2)
-with _c1:
-    _kid=st.text_input('KRX ID',value=_secret_or_env('KRX_ID'),key='_krx_id_input')
-with _c2:
-    _kpw=st.text_input('KRX 비밀번호',value=_secret_or_env('KRX_PW'),type='password',key='_krx_pw_input')
-if _kid: os.environ['KRX_ID']=_kid.strip()
-if _kpw: os.environ['KRX_PW']=_kpw
-st.caption('Streamlit Cloud에서는 Secrets에 KRX_ID와 KRX_PW를 저장할 수 있습니다. 별도 pykrxauth 설치는 필요하지 않습니다.')
-st.divider()
+def _db_connect():
+    conn=sqlite3.connect(str(DB_FILE),timeout=30)
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA synchronous=NORMAL')
+    return conn
 
-st.subheader('🔄 국내 ETF 실제 데이터 수집')
-_u1,_u2=st.columns([1,1.7])
-with _u1:
-    if st.button('KRX ETF 구성종목 DB 업데이트',type='primary',use_container_width=True):
-        if not (_secret_or_env('KRX_ID') and _secret_or_env('KRX_PW')):
-            st.error('위에 KRX ID와 비밀번호를 먼저 입력해 주세요.')
-            st.stop()
-        bar=st.progress(0,text='KRX 로그인 및 ETF 목록을 확인하는 중...')
-        def _progress(i,total,ticker,failed):
-            bar.progress(min(i/max(total,1),1.0),text=f'{i:,}/{total:,} · {ticker} · 실패 {failed:,}건')
-        try:
-            _m,_h,_status=collect_krx_etf_snapshot(progress=_progress)
-            st.session_state.etf_master=_m
-            st.session_state.etf_holdings=_h
-            st.session_state.collection_status=_status
-            bar.progress(1.0,text='수집 완료')
-            st.success(f"기준일 {_status['as_of']} · ETF {_status['success_etfs']:,}개 · 구성종목 {_status['holding_rows']:,}건 저장 완료")
-        except Exception as e:
-            st.error(f'수집 실패: {e}')
-with _u2:
-    _status=st.session_state.get('collection_status',{})
-    if _status:
-        c1,c2,c3,c4=st.columns(4)
-        c1.metric('기준일',_status.get('as_of','-'))
-        c2.metric('정상 ETF',f"{_status.get('success_etfs',0):,}")
-        c3.metric('구성종목',f"{_status.get('holding_rows',0):,}")
-        c4.metric('수집 실패',f"{_status.get('failed_etfs',0):,}")
-        st.caption(f"출처: {_status.get('source','KRX')} · 수집시각: {_status.get('collected_at','-')}")
-        if _status.get('failures'):
-            with st.expander('⚠️ 수집 실패 ETF 확인'):
-                st.dataframe(pd.DataFrame(_status['failures']),use_container_width=True,hide_index=True)
-    else:
-        st.info('아직 저장된 실제 ETF 스냅샷이 없습니다. 왼쪽 업데이트 버튼을 눌러 최초 DB를 생성하세요.')
 
-st.divider()
+def save_local_db(master,holdings):
+    '''수집 결과를 로컬 SQLite DB에 저장하고 검색 인덱스를 생성.'''
+    if master is None or master.empty or holdings is None or holdings.empty:
+        raise RuntimeError('저장할 ETF 데이터가 없습니다.')
 
-left,right=st.columns([0.82,1.45],gap='large')
-with left:
-    st.subheader('🌳 ETF 테크트리')
-    region=st.radio('STEP 1 · 투자대상', list(TREE.keys()), horizontal=True)
-    asset=st.selectbox('STEP 2 · 자산군', list(TREE[region].keys()))
-    sector=st.selectbox('STEP 3 · 산업/테마', list(TREE[region][asset].keys()))
-    subsector=st.selectbox('STEP 4 · 세부분야', TREE[region][asset][sector])
-    st.markdown(f'<div class="step">{region} → {asset} → {sector} → {subsector}</div>',unsafe_allow_html=True)
-    st.caption('테크트리 분류와 실제 ETF 편입 데이터는 분리 저장합니다.')
+    m=master.copy()
+    h=holdings.copy()
 
-with right:
-    st.subheader('🔎 조건에 맞는 ETF')
-    master=st.session_state.etf_master
-    if master.empty:
-        st.info('아직 실데이터 수집기가 연결되지 않았습니다. 잘못된 ETF를 임의로 표시하지 않고, 다음 단계에서 공식 데이터 기반 DB를 연결합니다.')
-        st.markdown('''**결과 카드에 표시할 항목**  
-ETF명 · 코드 · 운용사 · 순자산 · 거래대금 · 총보수 · 추종지수 · 관련도 · 구성종목 기준일 · 데이터 출처''')
-    else:
-        q=master[(master.asset_region==region)&(master.asset_class==asset)&(master.sector==sector)]
-        if subsector!='전체': q=q[q.subsector==subsector]
-        st.dataframe(q,use_container_width=True,hide_index=True)
+    for df in (m,h):
+        if 'etf_code' in df.columns:
+            df['etf_code']=df['etf_code'].astype(str).str.zfill(6)
+    if 'holding_code' in h.columns:
+        h['holding_code']=h['holding_code'].fillna('').astype(str)
+    if 'holding_name' in h.columns:
+        h['holding_name']=h['holding_name'].fillna('').astype(str)
+    if 'weight' in h.columns:
+        h['weight']=pd.to_numeric(h['weight'],errors='coerce').fillna(0.0)
 
-st.divider()
-a,b=st.columns([1,1.25],gap='large')
+    with _db_connect() as conn:
+        m.to_sql('etf_master',conn,if_exists='replace',index=False)
+        h.to_sql('etf_holdings',conn,if_exists='replace',index=False)
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_master_etf_code ON etf_master(etf_code)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_master_tree ON etf_master(asset_region,asset_class,sector,subsector)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_hold_etf_code ON etf_holdings(etf_code)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_hold_stock_code ON etf_holdings(holding_code)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_hold_stock_name ON etf_holdings(holding_name)')
+        conn.commit()
+
+
+def migrate_existing_csv_to_db():
+    '''기존 CSV가 있으면 KRX 재조회 없이 최초 1회 SQLite DB로 변환.'''
+    if DB_FILE.exists():
+        return False
+    if not (MASTER_FILE.exists() and HOLDINGS_FILE.exists()):
+        return False
+
+    master,holdings,_=load_snapshot()
+    if master.empty or holdings.empty:
+        return False
+
+    save_local_db(master,holdings)
+    return True
+
+
+def db_available():
+    if not DB_FILE.exists():
+        return False
+    try:
+        with _db_connect() as conn:
+            row=conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='etf_master'"
+            ).fetchone()
+            row2=conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='etf_holdings'"
+            ).fetchone()
+        return bool(row and row2)
+    except Exception:
+        return False
+
+
+def db_token():
+    try:
+        return DB_FILE.stat().st_mtime_ns
+    except Exception:
+        return 0
+
+
+@st.cache_data(show_spinner=False)
+def load_master_db(_token):
+    if not db_available():
+        return pd.DataFrame(columns=ETF_COLUMNS)
+    with _db_connect() as conn:
+        df=pd.read_sql_query('SELECT * FROM etf_master',conn)
+    if 'etf_code' in df.columns:
+        df['etf_code']=df['etf_code'].astype(str).str.zfill(6)
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_holdings_preview_db(_token,limit=500):
+    if not db_available():
+        return pd.DataFrame(columns=HOLDING_COLUMNS)
+    with _db_connect() as conn:
+        df=pd.read_sql_query(
+            'SELECT * FROM etf_holdings ORDER BY etf_code, weight DESC LIMIT ?',
+            conn,params=(int(limit),)
+        )
+    return df
+
+
+def local_db_stats():
+    if not db_available():
+        return {'etfs':0,'holdings':0}
+    try:
+        with _db_connect() as conn:
+            etfs=conn.execute('SELECT COUNT(*) FROM etf_master').fetchone()[0]
+            holdings=conn.execute('SELECT COUNT(*) FROM etf_holdings').fetchone()[0]
+        return {'etfs':int(etfs or 0),'holdings':int(holdings or 0)}
+    except Exception:
+        return {'etfs':0,'holdings':0}
+
+
 def normalize_stock_query(x):
-    return str(x or '').strip().replace(' ', '').lower()
+    return str(x or '').strip().replace(' ','').lower()
 
-def reverse_search_etf(master, holdings, query_text, min_weight=0.0, require_all=True):
-    """종목명 또는 종목코드로 ETF를 역검색하고 실제 편입비중 순으로 정렬한다."""
-    if holdings is None or holdings.empty:
+
+def reverse_search_etf_db(query_text,min_weight=0.0,require_all=True):
+    '''로컬 SQLite에서만 종목 역검색. 이 함수에서는 KRX/인터넷 호출을 하지 않음.'''
+    if not db_available():
         return pd.DataFrame()
+
     targets=[x.strip() for x in str(query_text).split(',') if x.strip()]
     if not targets:
         return pd.DataFrame()
-    h=holdings.copy()
-    h['weight']=pd.to_numeric(h['weight'],errors='coerce').fillna(0.0)
-    h['_name_key']=h['holding_name'].map(normalize_stock_query)
-    h['_code_key']=h['holding_code'].astype(str).str.strip().str.lower()
-    target_keys=[normalize_stock_query(x) for x in targets]
+
     parts=[]
-    for raw,key in zip(targets,target_keys):
-        # 정확한 종목명/코드 우선, 종목명 부분일치는 보조로 허용
-        m=(h['_name_key']==key)|(h['_code_key']==key)
-        if not m.any() and len(key)>=2:
-            m=h['_name_key'].str.contains(key,regex=False,na=False)
-        z=h[m].copy()
-        if not z.empty:
-            z['_target']=raw
-            parts.append(z)
+    with _db_connect() as conn:
+        for raw in targets:
+            key=normalize_stock_query(raw)
+
+            if key.isdigit():
+                code=key.zfill(6)
+                z=pd.read_sql_query(
+                    '''
+                    SELECT etf_code,holding_code,holding_name,weight,as_of,source
+                    FROM etf_holdings
+                    WHERE holding_code=?
+                    ''',
+                    conn,params=(code,)
+                )
+            else:
+                z=pd.read_sql_query(
+                    '''
+                    SELECT etf_code,holding_code,holding_name,weight,as_of,source
+                    FROM etf_holdings
+                    WHERE LOWER(REPLACE(holding_name,' ',''))=?
+                    ''',
+                    conn,params=(key,)
+                )
+                if z.empty and len(key)>=2:
+                    z=pd.read_sql_query(
+                        '''
+                        SELECT etf_code,holding_code,holding_name,weight,as_of,source
+                        FROM etf_holdings
+                        WHERE LOWER(REPLACE(holding_name,' ','')) LIKE ?
+                        ''',
+                        conn,params=(f'%{key}%',)
+                    )
+
+            if not z.empty:
+                z['_target']=raw
+                parts.append(z)
+
     if not parts:
         return pd.DataFrame()
+
     hits=pd.concat(parts,ignore_index=True)
+    hits['weight']=pd.to_numeric(hits['weight'],errors='coerce').fillna(0.0)
+
     agg=(hits.groupby('etf_code',as_index=False)
              .agg(match_weight=('weight','sum'),
                   match_count=('_target','nunique'),
                   matched_stocks=('holding_name',lambda x:', '.join(dict.fromkeys(map(str,x)))),
                   as_of=('as_of','max'),
                   source=('source',lambda x:' / '.join(dict.fromkeys(str(v) for v in x if pd.notna(v))))))
+
     if require_all:
         agg=agg[agg['match_count']>=len(targets)]
+
     agg=agg[agg['match_weight']>=float(min_weight)]
-    if master is not None and not master.empty:
-        cols=[c for c in ['etf_code','etf_name','issuer','aum','turnover','fee','index_name'] if c in master.columns]
-        agg=agg.merge(master[cols].drop_duplicates('etf_code'),on='etf_code',how='left')
-    order=[c for c in ['etf_name','etf_code','issuer','match_weight','matched_stocks','match_count','aum','turnover','fee','index_name','as_of','source'] if c in agg.columns]
-    return agg.sort_values(['match_weight','match_count'],ascending=[False,False])[order].reset_index(drop=True)
+    if agg.empty:
+        return pd.DataFrame()
+
+    codes=agg['etf_code'].astype(str).tolist()
+    placeholders=','.join('?' for _ in codes)
+    sql=(
+        'SELECT etf_code,etf_name,issuer,aum,turnover,fee,index_name '
+        f'FROM etf_master WHERE etf_code IN ({placeholders})'
+    )
+    with _db_connect() as conn:
+        master=pd.read_sql_query(sql,conn,params=codes)
+
+    out=agg.merge(master,on='etf_code',how='left')
+    order=[
+        c for c in [
+            'etf_name','etf_code','issuer','match_weight','matched_stocks',
+            'match_count','aum','turnover','fee','index_name','as_of','source'
+        ] if c in out.columns
+    ]
+    return (
+        out.sort_values(['match_weight','match_count'],ascending=[False,False])
+           [order]
+           .reset_index(drop=True)
+    )
+
+
+# 기존 CSV가 있다면 네트워크 접속 없이 SQLite로 1회 변환
+try:
+    _migrated=migrate_existing_csv_to_db()
+except Exception:
+    _migrated=False
+
+_status={}
+try:
+    if STATUS_FILE.exists():
+        _status=json.loads(STATUS_FILE.read_text(encoding='utf-8'))
+except Exception:
+    _status={}
+
+_token=db_token()
+master=load_master_db(_token)
+_stats=local_db_stats()
+
+
+# =========================================================
+# LOCAL DB STATUS / MANUAL UPDATE
+# =========================================================
+
+st.subheader('💾 로컬 ETF 데이터베이스')
+
+_s1,_s2,_s3,_s4=st.columns(4)
+_s1.metric('저장 ETF',f"{_stats['etfs']:,}")
+_s2.metric('구성종목',f"{_stats['holdings']:,}")
+_s3.metric('기준일',_status.get('as_of','-'))
+_s4.metric('DB 방식','SQLite')
+
+if _migrated:
+    st.success('기존 CSV 데이터를 로컬 SQLite DB로 자동 변환했습니다. KRX 재조회는 하지 않았습니다.')
+
+if db_available():
+    st.success('검색 모드: 로컬 DB 사용 중 · 일반 검색 시 KRX에 접속하지 않습니다.')
+else:
+    st.info('아직 로컬 DB가 없습니다. 아래 버튼을 한 번 실행해 최초 DB를 생성하세요.')
+
+_krx_ready=bool(_secret_or_env('KRX_ID') and _secret_or_env('KRX_PW'))
+if _krx_ready:
+    st.caption('🔐 KRX 로그인 정보: .streamlit/secrets.toml에서 자동 사용')
+else:
+    st.warning('KRX 업데이트용 Secrets가 없습니다. .streamlit/secrets.toml에 KRX_ID와 KRX_PW를 저장해 주세요.')
+
+with st.expander('🔄 KRX에서 로컬 DB 새로고침',expanded=not db_available()):
+    st.caption(
+        '이 버튼을 누를 때만 KRX 전체 데이터를 조회합니다. '
+        '저장 완료 후 종목검색·테크트리·ETF 조회는 모두 로컬 DB에서 실행됩니다.'
+    )
+
+    if st.button('KRX 전체 데이터로 로컬 DB 업데이트',type='primary',use_container_width=True):
+        if not _krx_ready:
+            st.error('secrets.toml의 KRX_ID / KRX_PW를 먼저 확인해 주세요.')
+            st.stop()
+
+        bar=st.progress(0,text='KRX ETF 데이터를 로컬 DB용으로 수집하는 중...')
+
+        def _progress(i,total,ticker,failed):
+            bar.progress(
+                min(i/max(total,1),1.0),
+                text=f'{i:,}/{total:,} · {ticker} · 실패 {failed:,}건'
+            )
+
+        try:
+            _m,_h,_status=collect_krx_etf_snapshot(progress=_progress)
+            save_local_db(_m,_h)
+            st.cache_data.clear()
+
+            bar.progress(1.0,text='로컬 DB 저장 완료')
+            st.success(
+                f"기준일 {_status['as_of']} · ETF {_status['success_etfs']:,}개 · "
+                f"구성종목 {_status['holding_rows']:,}건을 etf_finder.db에 저장했습니다."
+            )
+            st.rerun()
+        except Exception as e:
+            st.error(f'업데이트 실패: {e}')
+
+st.divider()
+
+
+# =========================================================
+# TREE SEARCH - LOCAL DB ONLY
+# =========================================================
+
+left,right=st.columns([0.82,1.45],gap='large')
+
+with left:
+    st.subheader('🌳 ETF 테크트리')
+    region=st.radio('STEP 1 · 투자대상',list(TREE.keys()),horizontal=True)
+    asset=st.selectbox('STEP 2 · 자산군',list(TREE[region].keys()))
+    sector=st.selectbox('STEP 3 · 산업/테마',list(TREE[region][asset].keys()))
+    subsector=st.selectbox('STEP 4 · 세부분야',TREE[region][asset][sector])
+    st.markdown(
+        f'<div class="step">{region} → {asset} → {sector} → {subsector}</div>',
+        unsafe_allow_html=True
+    )
+    st.caption('선택/검색 과정에서는 KRX에 접속하지 않습니다.')
+
+with right:
+    st.subheader('🔎 조건에 맞는 ETF')
+    if master.empty:
+        st.info('로컬 ETF DB가 비어 있습니다. 최초 1회 DB 업데이트가 필요합니다.')
+    else:
+        q=master.copy()
+        tree_cols=['asset_region','asset_class','sector','subsector']
+        mapped=(
+            all(c in q.columns for c in tree_cols)
+            and q['asset_region'].fillna('').astype(str).str.len().gt(0).any()
+        )
+        if mapped:
+            q=q[(q.asset_region==region)&(q.asset_class==asset)&(q.sector==sector)]
+            if subsector!='전체':
+                q=q[q.subsector==subsector]
+            if q.empty:
+                st.info('현재 로컬 DB에는 이 테크트리 분류로 매핑된 ETF가 없습니다.')
+            else:
+                st.dataframe(q,use_container_width=True,hide_index=True)
+        else:
+            st.info('실제 ETF 데이터는 저장되어 있지만 테크트리 분류 매핑은 아직 비어 있습니다. 종목 역검색은 바로 사용할 수 있습니다.')
+
+st.divider()
+
+
+# =========================================================
+# REVERSE STOCK SEARCH - LOCAL DB ONLY
+# =========================================================
+
+a,b=st.columns([1,1.25],gap='large')
 
 with a:
     st.subheader('🔍 종목으로 ETF 찾기')
-    st.caption('종목명 또는 6자리 종목코드를 입력하면 실제 편입비중이 높은 ETF부터 찾습니다.')
-    names=st.text_input('종목명 / 종목코드',placeholder='예: SK하이닉스 또는 000660 · 복수검색: 삼성전자, SK하이닉스')
+    st.caption('로컬 DB에서만 검색하므로 전체 ETF를 다시 조회하지 않습니다.')
+
+    names=st.text_input(
+        '종목명 / 종목코드',
+        placeholder='예: SK하이닉스 또는 000660 · 복수검색: 삼성전자, SK하이닉스'
+    )
+
     c1,c2=st.columns(2)
     with c1:
-        min_weight=st.number_input('최소 합산 편입비중 (%)',min_value=0.0,max_value=100.0,value=0.0,step=0.5)
+        min_weight=st.number_input(
+            '최소 합산 편입비중 (%)',
+            min_value=0.0,max_value=100.0,value=0.0,step=0.5
+        )
     with c2:
         match_mode=st.selectbox('복수 종목 조건',['모두 포함','하나 이상 포함'])
+
     if st.button('ETF 역검색',type='primary',use_container_width=True):
-        result=reverse_search_etf(
-            st.session_state.etf_master, st.session_state.etf_holdings, names,
-            min_weight=min_weight, require_all=(match_mode=='모두 포함')
-        )
-        if st.session_state.etf_holdings.empty:
-            st.warning('아직 실제 ETF 구성종목 DB가 비어 있습니다. 다음 단계에서 KRX/운용사 PDF 수집기를 연결하면 이 검색창이 즉시 실데이터로 동작합니다.')
-        elif result.empty:
-            st.info('조건에 맞는 ETF를 찾지 못했습니다. 종목명/코드 또는 최소 편입비중을 확인해 주세요.')
+        if not db_available():
+            st.warning('로컬 ETF DB가 없습니다. 최초 1회 DB 업데이트가 필요합니다.')
         else:
-            show=result.rename(columns={
-                'etf_name':'ETF명','etf_code':'ETF코드','issuer':'운용사',
-                'match_weight':'합산 편입비중(%)','matched_stocks':'일치 종목',
-                'match_count':'일치 종목수','aum':'순자산','turnover':'거래대금',
-                'fee':'총보수','index_name':'추종지수','as_of':'구성 기준일','source':'출처'
-            })
-            st.success(f'{len(show):,}개 ETF를 찾았습니다. 편입비중 높은 순입니다.')
-            st.dataframe(show,use_container_width=True,hide_index=True,
-                         column_config={'합산 편입비중(%)':st.column_config.NumberColumn(format='%.2f%%')})
+            with st.spinner('로컬 DB 검색 중...'):
+                result=reverse_search_etf_db(
+                    names,
+                    min_weight=min_weight,
+                    require_all=(match_mode=='모두 포함')
+                )
+
+            if result.empty:
+                st.info('조건에 맞는 ETF를 찾지 못했습니다. 종목명/코드 또는 최소 편입비중을 확인해 주세요.')
+            else:
+                show=result.rename(columns={
+                    'etf_name':'ETF명',
+                    'etf_code':'ETF코드',
+                    'issuer':'운용사',
+                    'match_weight':'합산 편입비중(%)',
+                    'matched_stocks':'일치 종목',
+                    'match_count':'일치 종목수',
+                    'aum':'순자산',
+                    'turnover':'거래대금',
+                    'fee':'총보수',
+                    'index_name':'추종지수',
+                    'as_of':'구성 기준일',
+                    'source':'출처'
+                })
+
+                st.success(f'{len(show):,}개 ETF를 찾았습니다. 로컬 DB 검색 결과입니다.')
+                st.dataframe(
+                    show,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        '합산 편입비중(%)':st.column_config.NumberColumn(format='%.2f%%')
+                    }
+                )
+
 with b:
-    st.subheader('🛡️ 데이터 신뢰도')
+    st.subheader('⚡ 검색 구조')
     st.markdown('''
-- **구성종목 기준일(as_of)**과 **수집시각(collected_at)**을 별도 저장
-- ETF/편입종목 데이터마다 **source** 저장
-- 이전 구성종목을 덮어쓰지 않고 날짜별 스냅샷 보존
-- 갱신 실패 시 오래된 데이터를 최신 데이터처럼 표시하지 않음
-- 공식 데이터와 운용사 자료를 교차검증할 수 있도록 수집 계층 분리
+- **최초 1회 / 수동 업데이트:** KRX → 로컬 DB 저장
+- **종목 역검색:** 로컬 SQLite DB만 조회
+- **테크트리 필터:** 로컬 ETF Master만 조회
+- **Streamlit 재실행:** 저장된 DB를 다시 사용
+- **검색할 때마다 1,000개 이상 ETF를 재수집하지 않음**
 ''')
-    st.caption(f'앱 실행 시각: {datetime.now():%Y-%m-%d %H:%M:%S}')
+    st.caption(f'로컬 DB: {DB_FILE.name} · 앱 실행 시각: {datetime.now():%Y-%m-%d %H:%M:%S}')
 
 st.divider()
-st.subheader('🗄️ V0.3 실제 데이터베이스')
-t1,t2=st.tabs(['ETF Master','ETF Holdings'])
-with t1: st.dataframe(st.session_state.etf_master,use_container_width=True,hide_index=True)
-with t2: st.dataframe(st.session_state.etf_holdings,use_container_width=True,hide_index=True)
+
+
+# =========================================================
+# LOCAL DB VIEW
+# =========================================================
+
+st.subheader('🗄️ 로컬 ETF DB')
+t1,t2=st.tabs(['ETF Master','ETF Holdings 미리보기'])
+
+with t1:
+    if master.empty:
+        st.info('저장된 ETF Master 데이터가 없습니다.')
+    else:
+        st.dataframe(master,use_container_width=True,hide_index=True)
+
+with t2:
+    if not db_available():
+        st.info('저장된 ETF Holdings 데이터가 없습니다.')
+    else:
+        preview=load_holdings_preview_db(db_token(),500)
+        st.caption(f"전체 {_stats['holdings']:,}건 중 최대 500건만 미리 표시합니다. 검색은 전체 DB를 대상으로 합니다.")
+        st.dataframe(preview,use_container_width=True,hide_index=True)
