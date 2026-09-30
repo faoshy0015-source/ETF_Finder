@@ -16,6 +16,21 @@ st.markdown('''
 .step{background:#0d1814;border:1px solid #29483e;border-radius:9px;padding:10px 12px;margin:5px 0;color:#dcebe5;font-weight:750}
 .result{background:#0d1713;border:1px solid #315b4c;border-left:4px solid #00b873;border-radius:9px;padding:12px;margin:8px 0}
 .muted{color:#8fa69d;font-size:12px}
+
+/* 테마 매핑 다시 생성: 흰 배경 제거 */
+.stButton > button[kind="secondary"],
+button[data-testid="stBaseButton-secondary"]{
+    background:transparent !important;
+    color:#dcebe5 !important;
+    border:1px solid #315b4c !important;
+    box-shadow:none !important;
+}
+.stButton > button[kind="secondary"]:hover,
+button[data-testid="stBaseButton-secondary"]:hover{
+    background:transparent !important;
+    color:#ffffff !important;
+    border-color:#4d7a6a !important;
+}
 </style>''', unsafe_allow_html=True)
 
 st.markdown('''<div class="hero"><h1>🧭 ETF Finder</h1><p>원하는 투자대상을 따라가면 조건에 맞는 ETF를 찾는 탐색 엔진 </p></div>''', unsafe_allow_html=True)
