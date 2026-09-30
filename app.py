@@ -1409,14 +1409,21 @@ def render_etf_detail(etf_code,key_prefix='detail'):
         if holdings.empty:
             st.info('현재 로컬 DB에 이 ETF의 구성종목 데이터가 없습니다.')
         else:
-            top=holdings.head(15).copy()
+            # 편입비중 높은 순으로 정렬
+            holdings=holdings.sort_values(
+                'weight',
+                ascending=False,
+                na_position='last'
+            ).reset_index(drop=True)
+
+            top=holdings.head(10).copy()
 
             if 'weight' in top.columns:
                 chart_top=top[['holding_name','weight']].copy()
                 chart_top=chart_top[
                     chart_top['holding_name'].fillna('').astype(str).str.len()>0
                 ]
-                chart_top=chart_top.sort_values('weight',ascending=True).tail(10)
+                chart_top=chart_top.sort_values('weight',ascending=False)
 
                 if not chart_top.empty:
                     st.bar_chart(
@@ -1424,19 +1431,12 @@ def render_etf_detail(etf_code,key_prefix='detail'):
                         use_container_width=True,
                         height=300
                     )
-                    st.caption('상위 구성종목 편입비중(%)')
+                    st.caption('상위 구성종목 편입비중(%) · 비중 높은 순')
 
-            show_cols=[
-                c for c in [
-                    'holding_name','holding_code','weight','quantity','as_of'
-                ] if c in holdings.columns
-            ]
-            holding_show=holdings[show_cols].copy().rename(columns={
+            # 좁은 상세영역에서도 바로 읽히도록 종목명 + 비중만 표시
+            holding_show=holdings[['holding_name','weight']].copy().rename(columns={
                 'holding_name':'구성종목',
-                'holding_code':'종목코드',
-                'weight':'편입비중(%)',
-                'quantity':'수량',
-                'as_of':'기준일'
+                'weight':'비중(%)'
             })
 
             st.dataframe(
@@ -1445,9 +1445,39 @@ def render_etf_detail(etf_code,key_prefix='detail'):
                 hide_index=True,
                 height=420,
                 column_config={
-                    '편입비중(%)':st.column_config.NumberColumn(format='%.2f%%')
+                    '구성종목':st.column_config.TextColumn(
+                        '구성종목',
+                        width='medium'
+                    ),
+                    '비중(%)':st.column_config.NumberColumn(
+                        '비중(%)',
+                        format='%.2f%%',
+                        width='small'
+                    )
                 }
             )
+
+            with st.expander('전체 구성종목 상세정보'):
+                detail_cols=[
+                    c for c in [
+                        'holding_name','holding_code','weight','quantity','as_of'
+                    ] if c in holdings.columns
+                ]
+                detail_show=holdings[detail_cols].copy().rename(columns={
+                    'holding_name':'구성종목',
+                    'holding_code':'종목코드',
+                    'weight':'비중(%)',
+                    'quantity':'수량',
+                    'as_of':'기준일'
+                })
+                st.dataframe(
+                    detail_show,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        '비중(%)':st.column_config.NumberColumn(format='%.2f%%')
+                    }
+                )
 
 
 # 기존 CSV가 있다면 네트워크 접속 없이 SQLite로 1회 변환
