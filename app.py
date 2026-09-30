@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import re
 import sqlite3
 import pandas as pd
 from datetime import datetime, timedelta
@@ -227,6 +228,299 @@ TREE = {
     }
 }
 
+# =========================================================
+# AUTO THEME MAPPING
+# ETF명 + 추종지수 + 구성종목명/비중을 이용한 로컬 규칙 기반 자동 매핑
+# =========================================================
+
+THEME_RULES_VERSION='2026-09-30-v2'
+
+THEME_KEYWORDS={
+    '반도체':['반도체','semiconductor','semicon','chip','sox'],
+    '메모리':['메모리','memory','dram','nand'],
+    'HBM':['hbm','high bandwidth memory'],
+    'AI 반도체':['ai반도체','ai semiconductor','gpu','npu','accelerator','엔비디아','nvidia'],
+    '파운드리':['파운드리','foundry','tsmc'],
+    '팹리스':['팹리스','fabless'],
+    '반도체 장비':['반도체장비','semiconductor equipment','asml','한미반도체','hpsp','원익ips','유진테크','주성엔지니어링'],
+    '반도체 소재·부품':['반도체소재','반도체부품','소부장','wafer','웨이퍼','솔브레인','isc'],
+    '후공정·패키징':['후공정','패키징','packaging','osat','테스트소켓','test socket'],
+    '전력반도체':['전력반도체','power semiconductor','sic','gan'],
+
+    '2차전지':['2차전지','이차전지','배터리','battery','리튬','lithium'],
+    '배터리 셀':['배터리셀','battery cell','lg에너지솔루션','삼성sdi','sk온'],
+    '양극재':['양극재','cathode','에코프로비엠','포스코퓨처엠','엘앤에프'],
+    '음극재':['음극재','anode'],
+    '전해질':['전해질','electrolyte'],
+    '분리막':['분리막','separator'],
+    '동박':['동박','copper foil','skc'],
+    '배터리 장비':['배터리장비','battery equipment','피엔티','윤성에프앤씨'],
+    '폐배터리·리사이클링':['폐배터리','리사이클','recycling','recycle'],
+    'ESS/BESS':['ess','bess','에너지저장','energy storage'],
+
+    'AI':['인공지능','artificial intelligence','generative ai','생성형ai','ai반도체','ai소프트웨어','ai플랫폼','ai인프라'],
+    '생성형 AI':['생성형ai','generative ai','llm','chatgpt'],
+    'AI 소프트웨어':['ai소프트웨어','ai software','software'],
+    'AI 플랫폼':['ai플랫폼','ai platform'],
+    'AI 인프라':['ai인프라','ai infrastructure','gpu','accelerator'],
+    '데이터센터':['데이터센터','data center','datacenter'],
+    '클라우드':['클라우드','cloud'],
+    'AI 전력수요':['ai전력','전력수요','power demand','data center power'],
+
+    '로봇':['로봇','robot','robotics','휴머노이드','humanoid'],
+    '휴머노이드':['휴머노이드','humanoid','레인보우로보틱스'],
+    '협동로봇':['협동로봇','cobot','두산로보틱스'],
+    '산업용 로봇':['산업용로봇','industrial robot'],
+    '서비스 로봇':['서비스로봇','service robot','로보티즈'],
+    '감속기':['감속기','reducer','gearbox','에스피지'],
+    '모터·액추에이터':['모터','motor','액추에이터','actuator','하이젠알앤엠'],
+    '센서·비전':['센서','sensor','비전','vision'],
+    '로봇 자동화':['로봇자동화','automation','factory automation'],
+
+    '자동차·모빌리티':['자동차','완성차','모빌리티','mobility','자율주행','전기차'],
+    '완성차':['완성차','현대차','기아','automaker'],
+    '전기차':['전기차','electric vehicle','tesla','테슬라'],
+    '자동차 부품':['자동차부품','auto parts','현대모비스'],
+    '자율주행':['자율주행','autonomous driving','self driving'],
+    'ADAS':['adas','첨단운전자'],
+    '전장':['전장','automotive electronics'],
+    '스마트카':['스마트카','smart car','connected car'],
+    '수소차':['수소차','fuel cell vehicle'],
+
+    '전력·전기기기':['전력','전기기기','변압기','전선','그리드','grid'],
+    '전력·그리드':['전력','그리드','grid','power infrastructure','변압기'],
+    '변압기':['변압기','transformer','hd현대일렉트릭','효성중공업','제룡전기'],
+    '배전기기':['배전','distribution equipment','ls electric'],
+    '전선':['전선','cable','대한전선','일진전기'],
+    '전력망·그리드':['전력망','power grid','grid'],
+    '스마트그리드':['스마트그리드','smart grid'],
+    '전력 인프라':['전력인프라','power infrastructure'],
+    '데이터센터 전력':['데이터센터전력','data center power'],
+
+    '원전·에너지':['원전','원자력','nuclear','smr','우라늄','uranium','태양광','solar','풍력','wind','수소','hydrogen','에너지'],
+    '원전':['원전','원자력','nuclear'],
+    'SMR':['smr','소형모듈원전','small modular reactor'],
+    '원전 기자재':['원전기자재','두산에너빌리티','한전기술','한전kps','비에이치아이'],
+    '태양광':['태양광','solar'],
+    '풍력':['풍력','wind'],
+    '수소':['수소','hydrogen'],
+    'LNG':['lng','천연가스','natural gas'],
+    '우라늄':['우라늄','uranium'],
+    '신재생에너지':['신재생','renewable'],
+
+    '방산·우주항공':['방산','국방','defense','defence','항공우주','aerospace','우주','space'],
+    '방산':['방산','defense','defence','한화에어로스페이스','lig넥스원','현대로템'],
+    '항공우주':['항공우주','aerospace','한국항공우주'],
+    '미사일':['미사일','missile','lig넥스원'],
+    '지상무기':['지상무기','현대로템'],
+    '레이더·전자전':['레이더','radar','전자전','한화시스템'],
+    '위성':['위성','satellite'],
+    '우주산업':['우주','space'],
+    '조선·함정':['함정','naval','한화오션','hd현대중공업'],
+
+    '조선·해운':['조선','해운','shipbuilding','shipping','선박'],
+    '조선':['조선','shipbuilding','hd한국조선해양','hd현대중공업','한화오션','삼성중공업'],
+    '조선 기자재':['조선기자재','ship equipment'],
+    'LNG선':['lng선','lng carrier'],
+    '친환경 선박':['친환경선박','green ship'],
+    '해운':['해운','shipping','hmm'],
+    '물류':['물류','logistics','cj대한통운'],
+    '항만':['항만','port'],
+
+    '바이오·헬스케어':['바이오','bio','제약','pharma','헬스케어','healthcare','의료'],
+    '제약':['제약','pharma','유한양행'],
+    '바이오':['바이오','bio','삼성바이오로직스','셀트리온','알테오젠'],
+    '바이오시밀러':['바이오시밀러','biosimilar','셀트리온'],
+    'CDMO·CMO':['cdmo','cmo','삼성바이오로직스'],
+    '의료기기':['의료기기','medical device'],
+    '진단':['진단','diagnostic'],
+    '디지털헬스':['디지털헬스','digital health'],
+    '비만·당뇨':['비만','obesity','당뇨','diabetes'],
+
+    '인터넷·플랫폼':['인터넷','platform','플랫폼','naver','카카오','이커머스'],
+    '인터넷 플랫폼':['인터넷플랫폼','naver','카카오','platform'],
+    '검색·포털':['검색','포털','search','naver'],
+    '핀테크':['핀테크','fintech','카카오페이'],
+    '이커머스':['이커머스','ecommerce','e-commerce','쿠팡','coupang'],
+    '광고·마케팅':['광고','advertising','marketing'],
+
+    '게임·콘텐츠':['게임','gaming','콘텐츠','content','엔터','entertainment','k-pop','웹툰'],
+    '게임':['게임','gaming','크래프톤','엔씨소프트','넷마블','펄어비스'],
+    '웹툰·웹소설':['웹툰','webtoon','웹소설'],
+    '엔터테인먼트':['엔터','entertainment','하이브','jyp','sm엔터'],
+    'K-POP':['k-pop','kpop','하이브','jyp'],
+    '미디어·방송':['미디어','media','방송'],
+    '영화·드라마':['영화','드라마','movie','drama'],
+    '콘텐츠 플랫폼':['콘텐츠플랫폼','content platform'],
+
+    '금융':['금융','은행','bank','증권','보험','financial'],
+    '은행':['은행','bank','kb금융','신한지주','하나금융지주','우리금융지주'],
+    '증권':['증권','securities','미래에셋증권','한국금융지주'],
+    '보험':['보험','insurance','삼성생명','삼성화재'],
+    '카드·결제':['결제','payment','card'],
+    '고배당 금융':['고배당금융','금융고배당'],
+
+    '소비재':['소비','consumer','화장품','cosmetic','뷰티','beauty','음식료','food','유통','retail','여행'],
+    '화장품':['화장품','cosmetic','아모레퍼시픽','lg생활건강','코스맥스','한국콜마'],
+    'K-뷰티':['k-beauty','k뷰티','화장품'],
+    '음식료':['음식료','food','삼양식품','농심','오리온','cj제일제당'],
+    '여행·레저':['여행','레저','travel','leisure'],
+    '호텔':['호텔','hotel'],
+
+    '건설·인프라':['건설','construction','인프라','infrastructure','시멘트','건설기계'],
+    '산업재·인프라':['산업재','industrial','인프라','infrastructure','건설','기계'],
+    '산업재·기계':['산업재','산업기계','기계','machinery','스마트팩토리','중공업'],
+    '화학·소재':['화학','chemical','소재','materials','철강','steel','희토류','rare earth'],
+    '운송·물류':['운송','물류','transport','logistics','항공','해운'],
+    '친환경·ESG':['esg','친환경','탄소중립','green','clean','재생에너지'],
+    '클린테크':['cleantech','clean tech','친환경','탄소중립','renewable'],
+    '농업·식품':['농업','agriculture','식품','food','곡물','비료','사료'],
+
+    '미국 대표지수':['s&p500','sp500','nasdaq100','나스닥100','dow','다우','russell','러셀'],
+    'S&P500':['s&p500','s&p 500','sp500'],
+    'NASDAQ100':['nasdaq100','nasdaq 100','나스닥100'],
+    '다우30':['dow30','dow 30','다우30'],
+    '러셀2000':['russell2000','russell 2000','러셀2000'],
+
+    '글로벌·국가':['글로벌','global','world','msci','중국','china','일본','japan','인도','india','베트남','vietnam','유럽','europe','대만','taiwan','신흥국'],
+    '빅테크':['빅테크','bigtech','big tech','magnificent','매그니피센트','fang'],
+    'Magnificent 7':['magnificent 7','magnificent7','매그니피센트7','m7'],
+    '플랫폼':['platform','플랫폼'],
+    '소프트웨어':['software','소프트웨어'],
+    '인터넷':['internet','인터넷'],
+    '전자상거래':['ecommerce','e-commerce','전자상거래'],
+
+    '사이버보안':['cybersecurity','cyber security','사이버보안'],
+    '클라우드 보안':['cloud security','클라우드보안'],
+    '네트워크 보안':['network security','네트워크보안'],
+    '양자컴퓨팅':['quantum computing','양자컴퓨팅','quantum'],
+    '양자통신':['quantum communication','양자통신'],
+
+    '배당·가치':['고배당','배당','dividend','밸류업','value','가치','저변동','퀄리티'],
+    '배당·스타일':['고배당','배당','dividend','배당성장','quality','value','momentum','저변동'],
+    '고배당':['고배당','high dividend'],
+    '배당성장':['배당성장','dividend growth'],
+    '저변동성':['저변동','low volatility'],
+    '가치주':['가치','value'],
+    '퀄리티':['퀄리티','quality'],
+    '밸류업':['밸류업','value up'],
+    '성장주':['성장','growth'],
+    '모멘텀':['모멘텀','momentum'],
+    '코스피200':['코스피200','kospi200'],
+    '코스닥150':['코스닥150','kosdaq150'],
+}
+
+# 대표 구성종목 → 산업/세부분야 보강 규칙
+COMPANY_THEME_HINTS={
+    '삼성전자':[('반도체','메모리'),('AI','AI 반도체')],
+    'sk하이닉스':[('반도체','메모리'),('반도체','HBM'),('AI','AI 반도체')],
+    '한미반도체':[('반도체','반도체 장비'),('반도체','HBM')],
+    'hpsp':[('반도체','반도체 장비')],
+    '원익ips':[('반도체','반도체 장비')],
+    'lg에너지솔루션':[('2차전지','배터리 셀')],
+    '삼성sdi':[('2차전지','배터리 셀')],
+    '에코프로비엠':[('2차전지','양극재')],
+    '포스코퓨처엠':[('2차전지','양극재')],
+    '레인보우로보틱스':[('로봇','휴머노이드')],
+    '두산로보틱스':[('로봇','협동로봇')],
+    '로보티즈':[('로봇','서비스 로봇')],
+    '에스피지':[('로봇','감속기')],
+    '하이젠알앤엠':[('로봇','모터·액추에이터')],
+    'hd현대일렉트릭':[('전력·전기기기','변압기')],
+    '효성중공업':[('전력·전기기기','변압기')],
+    '제룡전기':[('전력·전기기기','변압기')],
+    '두산에너빌리티':[('원전·에너지','원전 기자재')],
+    '한전기술':[('원전·에너지','원전 기자재')],
+    '한전kps':[('원전·에너지','원전 기자재')],
+    '한화에어로스페이스':[('방산·우주항공','방산')],
+    'lig넥스원':[('방산·우주항공','미사일')],
+    '한국항공우주':[('방산·우주항공','항공우주')],
+    '현대로템':[('방산·우주항공','지상무기')],
+    '한화시스템':[('방산·우주항공','레이더·전자전')],
+    'hd한국조선해양':[('조선·해운','조선')],
+    'hd현대중공업':[('조선·해운','조선')],
+    '한화오션':[('조선·해운','조선')],
+    '삼성중공업':[('조선·해운','조선')],
+    '삼성바이오로직스':[('바이오·헬스케어','CDMO·CMO'),('바이오·헬스케어','바이오')],
+    '셀트리온':[('바이오·헬스케어','바이오시밀러')],
+    '유한양행':[('바이오·헬스케어','제약')],
+    'naver':[('인터넷·플랫폼','인터넷 플랫폼'),('AI','AI 플랫폼')],
+    '카카오':[('인터넷·플랫폼','인터넷 플랫폼')],
+    '크래프톤':[('게임·콘텐츠','게임')],
+    '하이브':[('게임·콘텐츠','K-POP')],
+    'kb금융':[('금융','은행')],
+    '신한지주':[('금융','은행')],
+    '하나금융지주':[('금융','은행')],
+    '아모레퍼시픽':[('소비재','화장품')],
+    '코스맥스':[('소비재','화장품')],
+    '한국콜마':[('소비재','화장품')],
+    'nvidia':[('AI','AI 반도체'),('반도체','AI 반도체')],
+    '엔비디아':[('AI','AI 반도체'),('반도체','AI 반도체')],
+    'tsmc':[('반도체','파운드리')],
+    'asml':[('반도체','반도체 장비')],
+    'amd':[('반도체','AI 반도체')],
+    'microsoft':[('AI','AI 소프트웨어'),('빅테크','소프트웨어')],
+    'alphabet':[('AI','AI 플랫폼'),('빅테크','플랫폼')],
+    'amazon':[('AI','클라우드'),('빅테크','전자상거래')],
+    'meta platforms':[('AI','AI 플랫폼'),('빅테크','플랫폼')],
+    'tesla':[('전기차·배터리','전기차')],
+}
+
+
+def _norm_theme_text(value):
+    s=str(value or '').lower()
+    s=s.replace('&',' and ')
+    return re.sub(r'[\s_\-·/,+()\[\]{}:;.%]+','',s)
+
+
+def _theme_keywords(label):
+    vals=[label]
+    vals.extend(THEME_KEYWORDS.get(label,[]))
+    # 복합 라벨은 각 단어도 보조 키워드로 사용
+    for v in re.split(r'[·/+]',str(label)):
+        if len(v.strip())>=2:
+            vals.append(v.strip())
+    out=[]
+    seen=set()
+    for v in vals:
+        n=_norm_theme_text(v)
+        if n and n not in seen:
+            out.append(n)
+            seen.add(n)
+    return out
+
+
+def _infer_region_asset(etf_name,index_name):
+    n=_norm_theme_text(f'{etf_name} {index_name}')
+
+    overseas=[
+        '미국','s&p','sp500','nasdaq','나스닥','dow','다우','russell','러셀',
+        'global','글로벌','world','msci','china','중국','japan','일본','india','인도',
+        'vietnam','베트남','europe','유럽','taiwan','대만','emerging','신흥국',
+        '해외','treasury','미국채'
+    ]
+    region='해외자산' if any(_norm_theme_text(x) in n for x in overseas) else '국내자산'
+
+    if any(_norm_theme_text(x) in n for x in ['리츠','reit']):
+        asset='리츠'
+    elif any(_norm_theme_text(x) in n for x in [
+        '채권','국고채','국채','회사채','통안채','bond','treasury','하이일드'
+    ]):
+        asset='채권'
+    elif any(_norm_theme_text(x) in n for x in [
+        '원자재','commodity','gold','골드','silver','원유','oil','천연가스','구리','copper'
+    ]):
+        asset='원자재'
+    elif any(_norm_theme_text(x) in n for x in ['혼합','자산배분','멀티에셋','multiasset']):
+        asset='혼합자산'
+    else:
+        asset='주식'
+
+    if asset not in TREE.get(region,{}):
+        asset='주식'
+    return region,asset
+
+
 # V0.1 샘플 스키마. 실제 ETF 결과는 다음 단계의 수집 DB가 연결되기 전에는 생성하지 않는다.
 ETF_COLUMNS=['etf_code','etf_name','issuer','asset_region','asset_class','sector','subsector','aum','turnover','fee','index_name','as_of','source','collected_at']
 HOLDING_COLUMNS=['etf_code','holding_code','holding_name','weight','quantity','as_of','source','collected_at']
@@ -271,9 +565,10 @@ def _import_pykrx():
         return stock, f'pykrx {ver}'.strip()
     except ModuleNotFoundError as e:
         raise RuntimeError(
-            'pykrx가 현재 배포 환경에 설치되어 있지 않습니다. '
-            'Streamlit Cloud에서는 실행 중 pip 설치가 아니라 '
-            'app.py와 같은 폴더의 requirements.txt에 pykrx를 넣어 배포해야 합니다.'
+            'pykrx가 현재 Streamlit Cloud 환경에 설치되지 않았습니다. '
+            'GitHub 저장소에서 app.py와 requirements.txt가 같은 폴더에 있는지 확인한 뒤 '
+            'Streamlit Cloud를 재부팅(Reboot)해 주세요. '
+            'requirements.txt에는 pykrx==1.2.9가 포함되어 있어야 합니다.'
         ) from e
     except Exception as e:
         raise RuntimeError(f'pykrx 로딩 실패: {e}') from e
@@ -504,6 +799,9 @@ def save_local_db(master,holdings):
         conn.execute('CREATE INDEX IF NOT EXISTS idx_hold_etf_code ON etf_holdings(etf_code)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_hold_stock_code ON etf_holdings(holding_code)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_hold_stock_name ON etf_holdings(holding_name)')
+        # 원본 ETF DB가 바뀌면 기존 자동 테마 매핑은 무효화
+        conn.execute('DROP TABLE IF EXISTS etf_theme_map')
+        conn.execute('DROP TABLE IF EXISTS theme_meta')
         conn.commit()
 
 
@@ -674,6 +972,283 @@ def reverse_search_etf_db(query_text,min_weight=0.0,require_all=True):
     )
 
 
+
+def _theme_source_signature():
+    if not db_available():
+        return ''
+    with _db_connect() as conn:
+        m=conn.execute(
+            "SELECT COUNT(*),COALESCE(MAX(collected_at),''),COALESCE(MAX(as_of),'') FROM etf_master"
+        ).fetchone()
+        h=conn.execute(
+            "SELECT COUNT(*),COALESCE(MAX(collected_at),''),COALESCE(MAX(as_of),'') FROM etf_holdings"
+        ).fetchone()
+    return f'{m[0]}|{m[1]}|{m[2]}|{h[0]}|{h[1]}|{h[2]}|{THEME_RULES_VERSION}'
+
+
+def _saved_theme_signature():
+    try:
+        with _db_connect() as conn:
+            ok=conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='theme_meta'"
+            ).fetchone()
+            if not ok:
+                return ''
+            row=conn.execute(
+                "SELECT value FROM theme_meta WHERE key='source_signature'"
+            ).fetchone()
+        return row[0] if row else ''
+    except Exception:
+        return ''
+
+
+def _score_keywords(name_n,index_n,holdings,keywords):
+    score=0.0
+    evidence=[]
+
+    for kw in keywords:
+        if kw in name_n:
+            score+=8.0
+            evidence.append(f'ETF명:{kw}')
+        if kw in index_n:
+            score+=5.0
+            evidence.append(f'지수:{kw}')
+
+    for hname_n,hname_raw,weight in holdings:
+        if any(kw in hname_n for kw in keywords):
+            w=max(float(weight or 0),0.0)
+            score+=min(3.2,0.7+w/10.0)
+            evidence.append(f'구성:{hname_raw}({w:.1f}%)')
+
+    return score,evidence
+
+
+def _company_hint_scores(holdings):
+    sector_score={}
+    sub_score={}
+    ev={}
+    for hname_n,hname_raw,weight in holdings:
+        w=max(float(weight or 0),0.0)
+        for company,hints in COMPANY_THEME_HINTS.items():
+            if _norm_theme_text(company) in hname_n:
+                bonus=min(5.0,1.4+w/7.0)
+                for sector,sub in hints:
+                    sector_score[sector]=sector_score.get(sector,0.0)+bonus
+                    ev.setdefault(('s',sector),[]).append(f'구성:{hname_raw}({w:.1f}%)')
+                    if sub:
+                        sub_score[(sector,sub)]=sub_score.get((sector,sub),0.0)+bonus+0.8
+                        ev.setdefault(('d',sector,sub),[]).append(f'구성:{hname_raw}({w:.1f}%)')
+    return sector_score,sub_score,ev
+
+
+def build_theme_map():
+    """현재 SQLite DB만 사용해 자동 테마 매핑 생성. KRX/인터넷 호출 없음."""
+    if not db_available():
+        return {'mapped_etfs':0,'rows':0,'generated_at':''}
+
+    with _db_connect() as conn:
+        master_df=pd.read_sql_query(
+            'SELECT etf_code,etf_name,index_name,issuer,as_of FROM etf_master',
+            conn
+        )
+        holdings_df=pd.read_sql_query(
+            'SELECT etf_code,holding_name,weight FROM etf_holdings',
+            conn
+        )
+
+    if master_df.empty:
+        return {'mapped_etfs':0,'rows':0,'generated_at':''}
+
+    master_df['etf_code']=master_df['etf_code'].astype(str).str.zfill(6)
+    holdings_df['etf_code']=holdings_df['etf_code'].astype(str).str.zfill(6)
+    holdings_df['weight']=pd.to_numeric(holdings_df['weight'],errors='coerce').fillna(0.0)
+    holdings_df=holdings_df.sort_values(['etf_code','weight'],ascending=[True,False])
+
+    groups={}
+    for code,g in holdings_df.groupby('etf_code',sort=False):
+        rows=[]
+        for _,r in g.head(40).iterrows():
+            raw=str(r.get('holding_name','') or '')
+            if raw:
+                rows.append((_norm_theme_text(raw),raw,float(r.get('weight',0) or 0)))
+        groups[code]=rows
+
+    generated_at=datetime.now().isoformat(timespec='seconds')
+    mapped={}
+
+    for _,m in master_df.iterrows():
+        code=m['etf_code']
+        etf_name=str(m.get('etf_name','') or '')
+        index_name=str(m.get('index_name','') or '')
+        name_n=_norm_theme_text(etf_name)
+        index_n=_norm_theme_text(index_name)
+        hrows=groups.get(code,[])
+
+        region,asset=_infer_region_asset(etf_name,index_name)
+        sector_tree=TREE.get(region,{}).get(asset,{})
+        if not sector_tree:
+            continue
+
+        hint_sector,hint_sub,hint_ev=_company_hint_scores(hrows)
+
+        for sector,sub_list in sector_tree.items():
+            sec_score,sec_ev=_score_keywords(
+                name_n,index_n,hrows,_theme_keywords(sector)
+            )
+            sec_score+=hint_sector.get(sector,0.0)
+            sec_ev+=hint_ev.get(('s',sector),[])
+
+            detail=[]
+            best_sub=0.0
+            for sub in sub_list:
+                if sub=='전체':
+                    continue
+                sub_score,sub_ev=_score_keywords(
+                    name_n,index_n,hrows,_theme_keywords(sub)
+                )
+                sub_score+=hint_sub.get((sector,sub),0.0)
+                sub_ev+=hint_ev.get(('d',sector,sub),[])
+                best_sub=max(best_sub,sub_score)
+
+                if sub_score>=3.0:
+                    detail.append((sub,sub_score,sub_ev))
+
+            overall=max(sec_score,best_sub*0.72)
+
+            if overall>=2.8:
+                ev=list(dict.fromkeys(sec_ev))
+                if not ev and detail:
+                    ev=list(dict.fromkeys(detail[0][2]))
+                mapped[(code,region,asset,sector,'전체')]={
+                    'etf_code':code,
+                    'region':region,
+                    'asset_class':asset,
+                    'sector':sector,
+                    'subsector':'전체',
+                    'score':round(overall,2),
+                    'evidence':' · '.join(ev[:6]) or '세부분야 신호',
+                    'generated_at':generated_at,
+                    'rules_version':THEME_RULES_VERSION
+                }
+
+            for sub,sub_score,sub_ev in detail:
+                mapped[(code,region,asset,sector,sub)]={
+                    'etf_code':code,
+                    'region':region,
+                    'asset_class':asset,
+                    'sector':sector,
+                    'subsector':sub,
+                    'score':round(sub_score,2),
+                    'evidence':' · '.join(list(dict.fromkeys(sub_ev))[:6]) or f'{sub} 키워드',
+                    'generated_at':generated_at,
+                    'rules_version':THEME_RULES_VERSION
+                }
+
+    cols=[
+        'etf_code','region','asset_class','sector','subsector',
+        'score','evidence','generated_at','rules_version'
+    ]
+    theme_df=pd.DataFrame(list(mapped.values()),columns=cols)
+
+    with _db_connect() as conn:
+        if theme_df.empty:
+            conn.execute('DROP TABLE IF EXISTS etf_theme_map')
+            conn.execute(
+                'CREATE TABLE etf_theme_map('
+                'etf_code TEXT,region TEXT,asset_class TEXT,sector TEXT,'
+                'subsector TEXT,score REAL,evidence TEXT,generated_at TEXT,rules_version TEXT)'
+            )
+        else:
+            theme_df.to_sql('etf_theme_map',conn,if_exists='replace',index=False)
+
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_theme_tree '
+            'ON etf_theme_map(region,asset_class,sector,subsector)'
+        )
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_theme_code ON etf_theme_map(etf_code)'
+        )
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS theme_meta(key TEXT PRIMARY KEY,value TEXT)'
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO theme_meta(key,value) VALUES('source_signature',?)",
+            (_theme_source_signature(),)
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO theme_meta(key,value) VALUES('generated_at',?)",
+            (generated_at,)
+        )
+        conn.commit()
+
+    return {
+        'mapped_etfs':int(theme_df['etf_code'].nunique()) if not theme_df.empty else 0,
+        'rows':int(len(theme_df)),
+        'generated_at':generated_at
+    }
+
+
+def theme_map_stats():
+    if not db_available():
+        return {'mapped_etfs':0,'rows':0,'generated_at':''}
+    try:
+        with _db_connect() as conn:
+            ok=conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='etf_theme_map'"
+            ).fetchone()
+            if not ok:
+                return {'mapped_etfs':0,'rows':0,'generated_at':''}
+            row=conn.execute(
+                "SELECT COUNT(DISTINCT etf_code),COUNT(*),"
+                "COALESCE(MAX(generated_at),'') FROM etf_theme_map"
+            ).fetchone()
+        return {
+            'mapped_etfs':int(row[0] or 0),
+            'rows':int(row[1] or 0),
+            'generated_at':str(row[2] or '')
+        }
+    except Exception:
+        return {'mapped_etfs':0,'rows':0,'generated_at':''}
+
+
+def ensure_theme_map(force=False):
+    if not db_available():
+        return {'rebuilt':False,'mapped_etfs':0,'rows':0,'generated_at':''}
+    current=_theme_source_signature()
+    saved=_saved_theme_signature()
+    if force or not saved or saved!=current:
+        info=build_theme_map()
+        info['rebuilt']=True
+        return info
+    info=theme_map_stats()
+    info['rebuilt']=False
+    return info
+
+
+def search_theme_db(region,asset,sector,subsector):
+    """선택된 테크트리 조건을 로컬 자동매핑 테이블에서 검색."""
+    if not db_available():
+        return pd.DataFrame()
+
+    sql=(
+        'SELECT m.etf_name,m.etf_code,m.issuer,m.aum,m.turnover,m.fee,'
+        'm.index_name,m.as_of,t.score AS theme_score,t.evidence AS match_evidence '
+        'FROM etf_theme_map t '
+        'JOIN etf_master m ON m.etf_code=t.etf_code '
+        'WHERE t.region=? AND t.asset_class=? AND t.sector=? AND t.subsector=? '
+        'ORDER BY t.score DESC,COALESCE(m.turnover,0) DESC,m.etf_name'
+    )
+    try:
+        with _db_connect() as conn:
+            df=pd.read_sql_query(
+                sql,conn,params=(region,asset,sector,subsector)
+            )
+        if not df.empty:
+            df['etf_code']=df['etf_code'].astype(str).str.zfill(6)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
 # 기존 CSV가 있다면 네트워크 접속 없이 SQLite로 1회 변환
 try:
     _migrated=migrate_existing_csv_to_db()
@@ -687,16 +1262,37 @@ try:
 except Exception:
     _status={}
 
+_theme_info={'rebuilt':False,'mapped_etfs':0,'rows':0,'generated_at':''}
+_theme_error=''
+if db_available():
+    try:
+        _theme_info=ensure_theme_map()
+    except Exception as _e:
+        _theme_error=str(_e)
+
 _token=db_token()
 master=load_master_db(_token)
 _stats=local_db_stats()
+_theme_stats=theme_map_stats()
 
 
 # =========================================================
 # LOCAL DB STATUS / MANUAL UPDATE
 # =========================================================
 
+
 st.subheader('💾 로컬 ETF 데이터베이스')
+
+with st.expander('🧪 배포환경 진단', expanded=False):
+    import sys as _sys
+    st.write('Python:', _sys.version.split()[0])
+    st.write('실행 파일:', _sys.executable)
+    try:
+        import pykrx as _pk
+        st.success(f"pykrx 설치됨 · {getattr(_pk,'__version__',getattr(_pk,'version','버전 미확인'))}")
+    except Exception as _e:
+        st.error(f"pykrx 미설치/로드 실패 · {_e}")
+
 
 _s1,_s2,_s3,_s4=st.columns(4)
 _s1.metric('저장 ETF',f"{_stats['etfs']:,}")
@@ -709,6 +1305,27 @@ if _migrated:
 
 if db_available():
     st.success('검색 모드: 로컬 DB 사용 중 · 일반 검색 시 KRX에 접속하지 않습니다.')
+
+    if _theme_error:
+        st.warning(f'자동 테마 매핑 오류: {_theme_error}')
+    else:
+        st.caption(
+            f"🧠 자동 테마 매핑 · ETF {_theme_stats.get('mapped_etfs',0):,}개 · "
+            f"매핑 {_theme_stats.get('rows',0):,}건 · "
+            f"생성 {_theme_stats.get('generated_at','-') or '-'}"
+        )
+        if _theme_info.get('rebuilt'):
+            st.success('ETF명·추종지수·구성종목을 기준으로 테마 매핑을 자동 생성했습니다.')
+
+        if st.button('🧠 테마 매핑 다시 생성',key='rebuild_theme_map'):
+            with st.spinner('로컬 DB에서 테마를 다시 분류하는 중...'):
+                _new_theme=ensure_theme_map(force=True)
+                st.cache_data.clear()
+            st.success(
+                f"테마 매핑 완료 · ETF {_new_theme.get('mapped_etfs',0):,}개 · "
+                f"매핑 {_new_theme.get('rows',0):,}건"
+            )
+            st.rerun()
 else:
     st.info('아직 로컬 DB가 없습니다. 아래 버튼을 한 번 실행해 최초 DB를 생성하세요.')
 
@@ -762,37 +1379,117 @@ left,right=st.columns([0.82,1.45],gap='large')
 
 with left:
     st.subheader('🌳 ETF 테크트리')
-    region=st.radio('STEP 1 · 투자대상',list(TREE.keys()),horizontal=True)
-    asset=st.selectbox('STEP 2 · 자산군',list(TREE[region].keys()))
-    sector=st.selectbox('STEP 3 · 산업/테마',list(TREE[region][asset].keys()))
-    subsector=st.selectbox('STEP 4 · 세부분야',TREE[region][asset][sector])
+    region=st.radio(
+        'STEP 1 · 투자대상',
+        list(TREE.keys()),
+        horizontal=True,
+        key='tree_region'
+    )
+    asset=st.selectbox(
+        'STEP 2 · 자산군',
+        list(TREE[region].keys()),
+        key='tree_asset'
+    )
+    sector=st.selectbox(
+        'STEP 3 · 산업/테마',
+        list(TREE[region][asset].keys()),
+        key='tree_sector'
+    )
+    subsector=st.selectbox(
+        'STEP 4 · 세부분야',
+        TREE[region][asset][sector],
+        key='tree_subsector'
+    )
+
     st.markdown(
         f'<div class="step">{region} → {asset} → {sector} → {subsector}</div>',
         unsafe_allow_html=True
     )
-    st.caption('선택/검색 과정에서는 KRX에 접속하지 않습니다.')
+
+    tree_search_clicked=st.button(
+        '🔎 선택 조건으로 ETF 검색',
+        type='primary',
+        use_container_width=True,
+        key='tree_search_button'
+    )
+
+    current_tree=(region,asset,sector,subsector)
+
+    if tree_search_clicked:
+        st.session_state['tree_search_params']=current_tree
+        st.session_state['tree_search_requested']=True
+
+    saved_tree=st.session_state.get('tree_search_params')
+    if saved_tree and saved_tree!=current_tree:
+        st.caption('선택 조건이 변경되었습니다. 새 조건으로 보려면 검색 버튼을 다시 눌러주세요.')
+    else:
+        st.caption('검색은 저장된 로컬 DB만 사용하며 KRX에 다시 접속하지 않습니다.')
 
 with right:
     st.subheader('🔎 조건에 맞는 ETF')
+
     if master.empty:
         st.info('로컬 ETF DB가 비어 있습니다. 최초 1회 DB 업데이트가 필요합니다.')
+
+    elif _theme_error:
+        st.warning(f'테마 매핑을 사용할 수 없습니다: {_theme_error}')
+
+    elif not st.session_state.get('tree_search_requested'):
+        st.info('왼쪽에서 조건을 선택한 뒤 **선택 조건으로 ETF 검색** 버튼을 눌러주세요.')
+
     else:
-        q=master.copy()
-        tree_cols=['asset_region','asset_class','sector','subsector']
-        mapped=(
-            all(c in q.columns for c in tree_cols)
-            and q['asset_region'].fillna('').astype(str).str.len().gt(0).any()
-        )
-        if mapped:
-            q=q[(q.asset_region==region)&(q.asset_class==asset)&(q.sector==sector)]
-            if subsector!='전체':
-                q=q[q.subsector==subsector]
-            if q.empty:
-                st.info('현재 로컬 DB에는 이 테크트리 분류로 매핑된 ETF가 없습니다.')
-            else:
-                st.dataframe(q,use_container_width=True,hide_index=True)
+        params=st.session_state.get('tree_search_params')
+        if not params:
+            st.info('검색 조건을 선택해 주세요.')
         else:
-            st.info('실제 ETF 데이터는 저장되어 있지만 테크트리 분류 매핑은 아직 비어 있습니다. 종목 역검색은 바로 사용할 수 있습니다.')
+            s_region,s_asset,s_sector,s_subsector=params
+
+            st.caption(
+                f'검색조건: {s_region} → {s_asset} → {s_sector} → {s_subsector}'
+            )
+
+            with st.spinner('로컬 테마 DB 검색 중...'):
+                q=search_theme_db(
+                    s_region,s_asset,s_sector,s_subsector
+                )
+
+            if q.empty:
+                st.info(
+                    '현재 자동 매핑 기준으로 해당 조건에 맞는 ETF를 찾지 못했습니다. '
+                    'ETF명·추종지수·구성종목 정보가 부족한 상품은 누락될 수 있습니다.'
+                )
+            else:
+                show=q.rename(columns={
+                    'etf_name':'ETF명',
+                    'etf_code':'ETF코드',
+                    'issuer':'운용사',
+                    'aum':'순자산',
+                    'turnover':'거래대금',
+                    'fee':'총보수',
+                    'index_name':'추종지수',
+                    'as_of':'구성 기준일',
+                    'theme_score':'매핑점수',
+                    'match_evidence':'매핑 근거'
+                })
+
+                st.success(
+                    f'{len(show):,}개 ETF를 찾았습니다. '
+                    'ETF명·추종지수·구성종목 기반 자동 테마 매핑 결과입니다.'
+                )
+
+                st.dataframe(
+                    show,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        '매핑점수':st.column_config.NumberColumn(format='%.2f')
+                    }
+                )
+
+                st.caption(
+                    '매핑점수는 ETF명 신호를 가장 크게, 추종지수와 구성종목/편입비중을 '
+                    '보조적으로 반영한 규칙 기반 분류 점수입니다. 투자성과 점수가 아닙니다.'
+                )
 
 st.divider()
 
@@ -879,7 +1576,7 @@ st.divider()
 # =========================================================
 
 st.subheader('🗄️ 로컬 ETF DB')
-t1,t2=st.tabs(['ETF Master','ETF Holdings 미리보기'])
+t1,t2,t3=st.tabs(['ETF Master','ETF Holdings 미리보기','자동 테마 매핑'])
 
 with t1:
     if master.empty:
@@ -894,3 +1591,24 @@ with t2:
         preview=load_holdings_preview_db(db_token(),500)
         st.caption(f"전체 {_stats['holdings']:,}건 중 최대 500건만 미리 표시합니다. 검색은 전체 DB를 대상으로 합니다.")
         st.dataframe(preview,use_container_width=True,hide_index=True)
+
+with t3:
+    if not db_available():
+        st.info('로컬 DB가 없습니다.')
+    elif _theme_error:
+        st.warning(f'자동 테마 매핑 오류: {_theme_error}')
+    else:
+        try:
+            with _db_connect() as conn:
+                theme_preview=pd.read_sql_query(
+                    'SELECT etf_code,region,asset_class,sector,subsector,score,evidence '
+                    'FROM etf_theme_map ORDER BY score DESC LIMIT 500',
+                    conn
+                )
+            st.caption(
+                f"전체 자동 매핑 {_theme_stats.get('rows',0):,}건 중 최대 500건을 표시합니다."
+            )
+            st.dataframe(theme_preview,use_container_width=True,hide_index=True)
+        except Exception as _e:
+            st.warning(f'테마 매핑 미리보기를 불러오지 못했습니다: {_e}')
+
