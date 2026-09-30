@@ -1249,6 +1249,207 @@ def search_theme_db(region,asset,sector,subsector):
     except Exception:
         return pd.DataFrame()
 
+# =========================================================
+# ETF DETAIL VIEW
+# 검색 결과 행 클릭 → 가격차트 + 구성종목
+# =========================================================
+
+@st.cache_data(show_spinner=False)
+def get_etf_holdings_local(etf_code,_db_token):
+    if not db_available():
+        return pd.DataFrame(columns=HOLDING_COLUMNS)
+
+    code=str(etf_code).zfill(6)
+    sql=(
+        "SELECT holding_code,holding_name,weight,quantity,as_of,source "
+        "FROM etf_holdings WHERE etf_code=? "
+        "ORDER BY weight DESC,holding_name"
+    )
+    with _db_connect() as conn:
+        df=pd.read_sql_query(sql,conn,params=(code,))
+
+    if 'weight' in df.columns:
+        df['weight']=pd.to_numeric(df['weight'],errors='coerce').fillna(0.0)
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def get_etf_master_local(etf_code,_db_token):
+    if not db_available():
+        return {}
+
+    code=str(etf_code).zfill(6)
+    sql="SELECT * FROM etf_master WHERE etf_code=? LIMIT 1"
+    with _db_connect() as conn:
+        df=pd.read_sql_query(sql,conn,params=(code,))
+    return df.iloc[0].to_dict() if not df.empty else {}
+
+
+@st.cache_data(ttl=1800,show_spinner=False)
+def get_etf_price_history(etf_code,period_label):
+    days_map={'1개월':45,'3개월':120,'6개월':230,'1년':420}
+    days=days_map.get(period_label,230)
+
+    end=datetime.now()
+    start=end-timedelta(days=days)
+
+    stock,_collector_mode=_import_pykrx()
+    df=stock.get_etf_ohlcv_by_date(
+        start.strftime('%Y%m%d'),
+        end.strftime('%Y%m%d'),
+        str(etf_code).zfill(6)
+    )
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out=df.reset_index().copy()
+
+    date_col=None
+    for c in ['날짜','Date','date','index']:
+        if c in out.columns:
+            date_col=c
+            break
+    if date_col is None:
+        date_col=out.columns[0]
+
+    out[date_col]=pd.to_datetime(out[date_col],errors='coerce')
+    out=out.dropna(subset=[date_col])
+
+    if '종가' not in out.columns:
+        return pd.DataFrame()
+
+    out['종가']=pd.to_numeric(out['종가'],errors='coerce')
+    out=out.dropna(subset=['종가'])
+    out=out.rename(columns={date_col:'날짜'})
+    return out
+
+
+def _set_selected_etf(etf_code,etf_name='',source=''):
+    st.session_state['selected_etf_code']=str(etf_code).zfill(6)
+    st.session_state['selected_etf_name']=str(etf_name or '')
+    st.session_state['selected_etf_source']=str(source or '')
+
+
+def render_etf_detail(etf_code,key_prefix='detail'):
+    code=str(etf_code).zfill(6)
+    master_row=get_etf_master_local(code,db_token())
+    holdings=get_etf_holdings_local(code,db_token())
+
+    etf_name=str(
+        master_row.get('etf_name')
+        or st.session_state.get('selected_etf_name')
+        or code
+    )
+
+    st.markdown('---')
+    st.subheader(f'📈 {etf_name} · {code}')
+    st.caption('선택한 ETF의 가격차트와 로컬 DB 구성종목입니다.')
+
+    basis_date='-'
+    if master_row.get('as_of'):
+        basis_date=str(master_row.get('as_of'))
+    elif not holdings.empty and 'as_of' in holdings.columns:
+        basis_date=str(holdings['as_of'].iloc[0])
+
+    info_cols=st.columns(4)
+    info_cols[0].metric('ETF 코드',code)
+    info_cols[1].metric('구성종목',f'{len(holdings):,}개')
+    info_cols[2].metric('구성 기준일',basis_date)
+    info_cols[3].metric('추종지수',str(master_row.get('index_name') or '-')[:28])
+
+    chart_col,holding_col=st.columns([1.35,1],gap='large')
+
+    with chart_col:
+        st.markdown('#### 가격 차트')
+        period=st.radio(
+            '조회기간',
+            ['1개월','3개월','6개월','1년'],
+            index=2,
+            horizontal=True,
+            key=f'{key_prefix}_period_{code}'
+        )
+
+        try:
+            with st.spinner('선택 ETF 가격차트를 불러오는 중...'):
+                price_df=get_etf_price_history(code,period)
+
+            if price_df.empty:
+                st.info('해당 기간의 가격 데이터를 불러오지 못했습니다.')
+            else:
+                p=price_df[['날짜','종가']].dropna().sort_values('날짜').copy()
+                last=float(p['종가'].iloc[-1])
+                prev=float(p['종가'].iloc[-2]) if len(p)>=2 else last
+                change=((last/prev)-1)*100 if prev else 0.0
+
+                m1,m2=st.columns(2)
+                m1.metric('최근 종가',f'{last:,.0f}원',f'{change:+.2f}%')
+                m2.metric('조회 데이터',f'{len(p):,}일')
+
+                st.line_chart(
+                    p.set_index('날짜')[['종가']],
+                    use_container_width=True,
+                    height=390
+                )
+
+                st.caption(
+                    f"{p['날짜'].min():%Y-%m-%d} ~ {p['날짜'].max():%Y-%m-%d} · "
+                    "차트만 선택 시 KRX에서 조회합니다."
+                )
+
+        except Exception as e:
+            st.warning(
+                '가격차트를 불러오지 못했습니다. 구성종목은 로컬 DB 데이터로 계속 확인할 수 있습니다. '
+                f'차트 오류: {e}'
+            )
+
+    with holding_col:
+        st.markdown('#### 주요 구성종목')
+
+        if holdings.empty:
+            st.info('현재 로컬 DB에 이 ETF의 구성종목 데이터가 없습니다.')
+        else:
+            top=holdings.head(15).copy()
+
+            if 'weight' in top.columns:
+                chart_top=top[['holding_name','weight']].copy()
+                chart_top=chart_top[
+                    chart_top['holding_name'].fillna('').astype(str).str.len()>0
+                ]
+                chart_top=chart_top.sort_values('weight',ascending=True).tail(10)
+
+                if not chart_top.empty:
+                    st.bar_chart(
+                        chart_top.set_index('holding_name')['weight'],
+                        use_container_width=True,
+                        height=300
+                    )
+                    st.caption('상위 구성종목 편입비중(%)')
+
+            show_cols=[
+                c for c in [
+                    'holding_name','holding_code','weight','quantity','as_of'
+                ] if c in holdings.columns
+            ]
+            holding_show=holdings[show_cols].copy().rename(columns={
+                'holding_name':'구성종목',
+                'holding_code':'종목코드',
+                'weight':'편입비중(%)',
+                'quantity':'수량',
+                'as_of':'기준일'
+            })
+
+            st.dataframe(
+                holding_show,
+                use_container_width=True,
+                hide_index=True,
+                height=420,
+                column_config={
+                    '편입비중(%)':st.column_config.NumberColumn(format='%.2f%%')
+                }
+            )
+
+
 # 기존 CSV가 있다면 네트워크 접속 없이 SQLite로 1회 변환
 try:
     _migrated=migrate_existing_csv_to_db()
@@ -1477,19 +1678,48 @@ with right:
                     'ETF명·추종지수·구성종목 기반 자동 테마 매핑 결과입니다.'
                 )
 
-                st.dataframe(
+                st.caption('👇 ETF 행을 클릭하면 아래에 가격차트와 구성종목이 표시됩니다.')
+
+                theme_event=st.dataframe(
                     show,
                     use_container_width=True,
                     hide_index=True,
+                    on_select='rerun',
+                    selection_mode='single-row',
+                    key='theme_search_results_table',
                     column_config={
                         '매핑점수':st.column_config.NumberColumn(format='%.2f')
                     }
                 )
 
+                try:
+                    selected_rows=list(theme_event.selection.rows)
+                except Exception:
+                    selected_rows=[]
+
+                if selected_rows:
+                    _idx=int(selected_rows[0])
+                    if 0<=_idx<len(show):
+                        _row=show.iloc[_idx]
+                        _set_selected_etf(
+                            _row.get('ETF코드',''),
+                            _row.get('ETF명',''),
+                            'theme'
+                        )
+
                 st.caption(
                     '매핑점수는 ETF명 신호를 가장 크게, 추종지수와 구성종목/편입비중을 '
                     '보조적으로 반영한 규칙 기반 분류 점수입니다. 투자성과 점수가 아닙니다.'
                 )
+
+                if (
+                    st.session_state.get('selected_etf_code')
+                    and st.session_state.get('selected_etf_source')=='theme'
+                ):
+                    render_etf_detail(
+                        st.session_state['selected_etf_code'],
+                        key_prefix='theme_detail'
+                    )
 
 st.divider()
 
@@ -1521,6 +1751,7 @@ with a:
     if st.button('ETF 역검색',type='primary',use_container_width=True):
         if not db_available():
             st.warning('로컬 ETF DB가 없습니다. 최초 1회 DB 업데이트가 필요합니다.')
+            st.session_state.pop('reverse_search_result',None)
         else:
             with st.spinner('로컬 DB 검색 중...'):
                 result=reverse_search_etf_db(
@@ -1528,33 +1759,66 @@ with a:
                     min_weight=min_weight,
                     require_all=(match_mode=='모두 포함')
                 )
+            st.session_state['reverse_search_result']=result
 
-            if result.empty:
-                st.info('조건에 맞는 ETF를 찾지 못했습니다. 종목명/코드 또는 최소 편입비중을 확인해 주세요.')
-            else:
-                show=result.rename(columns={
-                    'etf_name':'ETF명',
-                    'etf_code':'ETF코드',
-                    'issuer':'운용사',
-                    'match_weight':'합산 편입비중(%)',
-                    'matched_stocks':'일치 종목',
-                    'match_count':'일치 종목수',
-                    'aum':'순자산',
-                    'turnover':'거래대금',
-                    'fee':'총보수',
-                    'index_name':'추종지수',
-                    'as_of':'구성 기준일',
-                    'source':'출처'
-                })
+    result=st.session_state.get('reverse_search_result')
 
-                st.success(f'{len(show):,}개 ETF를 찾았습니다. 로컬 DB 검색 결과입니다.')
-                st.dataframe(
-                    show,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        '합산 편입비중(%)':st.column_config.NumberColumn(format='%.2f%%')
-                    }
+    if isinstance(result,pd.DataFrame):
+        if result.empty:
+            st.info('조건에 맞는 ETF를 찾지 못했습니다. 종목명/코드 또는 최소 편입비중을 확인해 주세요.')
+        else:
+            show=result.rename(columns={
+                'etf_name':'ETF명',
+                'etf_code':'ETF코드',
+                'issuer':'운용사',
+                'match_weight':'합산 편입비중(%)',
+                'matched_stocks':'일치 종목',
+                'match_count':'일치 종목수',
+                'aum':'순자산',
+                'turnover':'거래대금',
+                'fee':'총보수',
+                'index_name':'추종지수',
+                'as_of':'구성 기준일',
+                'source':'출처'
+            })
+
+            st.success(f'{len(show):,}개 ETF를 찾았습니다. 로컬 DB 검색 결과입니다.')
+            st.caption('👇 ETF 행을 클릭하면 아래에 가격차트와 구성종목이 표시됩니다.')
+
+            reverse_event=st.dataframe(
+                show,
+                use_container_width=True,
+                hide_index=True,
+                on_select='rerun',
+                selection_mode='single-row',
+                key='reverse_search_results_table',
+                column_config={
+                    '합산 편입비중(%)':st.column_config.NumberColumn(format='%.2f%%')
+                }
+            )
+
+            try:
+                reverse_rows=list(reverse_event.selection.rows)
+            except Exception:
+                reverse_rows=[]
+
+            if reverse_rows:
+                _idx=int(reverse_rows[0])
+                if 0<=_idx<len(show):
+                    _row=show.iloc[_idx]
+                    _set_selected_etf(
+                        _row.get('ETF코드',''),
+                        _row.get('ETF명',''),
+                        'reverse'
+                    )
+
+            if (
+                st.session_state.get('selected_etf_code')
+                and st.session_state.get('selected_etf_source')=='reverse'
+            ):
+                render_etf_detail(
+                    st.session_state['selected_etf_code'],
+                    key_prefix='reverse_detail'
                 )
 
 with b:
@@ -1564,7 +1828,7 @@ with b:
 - **종목 역검색:** 로컬 SQLite DB만 조회
 - **테크트리 필터:** 로컬 ETF Master만 조회
 - **Streamlit 재실행:** 저장된 DB를 다시 사용
-- **검색할 때마다 1,000개 이상 ETF를 재수집하지 않음**
+- **검색할 때마다 1,000개 이상 ETF를 재수집하지 않음**\n- **검색 결과 행 클릭:** 가격차트 + 구성종목 표시
 ''')
     st.caption(f'로컬 DB: {DB_FILE.name} · 앱 실행 시각: {datetime.now():%Y-%m-%d %H:%M:%S}')
 
