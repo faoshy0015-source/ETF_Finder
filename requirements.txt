@@ -1,6 +1,6 @@
-streamlit>=1.40
-pandas>=2.0
-requests>=2.31
 streamlit
-pandas
-pykrx
+pandas>=2.2,<3
+numpy>=2
+requests>=2.32
+pykrx==1.2.9
+
