@@ -1,4 +1,5 @@
 import streamlit as st
+import os
 import pandas as pd
 from datetime import datetime
 
@@ -63,12 +64,33 @@ MASTER_FILE=DATA_DIR/'etf_master.csv'
 HOLDINGS_FILE=DATA_DIR/'etf_holdings.csv'
 STATUS_FILE=DATA_DIR/'collection_status.json'
 
-def _import_pykrx():
+def _secret_or_env(name):
     try:
+        if name in st.secrets:
+            return str(st.secrets[name]).strip()
+    except Exception:
+        pass
+    return os.getenv(name, '').strip()
+
+def _import_pykrx():
+    # pykrx >= 1.2.x는 KRX_ID / KRX_PW 환경변수를 읽어
+    # KRX 로그인 세션을 내부에서 자동으로 관리한다.
+    krx_id=_secret_or_env('KRX_ID')
+    krx_pw=_secret_or_env('KRX_PW')
+    if not krx_id or not krx_pw:
+        raise RuntimeError('KRX ID와 비밀번호를 먼저 입력해 주세요.')
+    os.environ['KRX_ID']=krx_id
+    os.environ['KRX_PW']=krx_pw
+    try:
+        import pykrx
         from pykrx import stock
-        return stock
+        ver=getattr(pykrx,'__version__',getattr(pykrx,'version',''))
+        return stock, f'pykrx {ver}'.strip()
     except Exception as e:
-        raise RuntimeError('pykrx가 설치되지 않았습니다. PowerShell에서 python -m pip install pykrx 를 실행해 주세요.') from e
+        raise RuntimeError(
+            'pykrx를 불러오지 못했습니다. PowerShell에서 '
+            'python -m pip install --upgrade pykrx 를 실행해 주세요.'
+        ) from e
 
 def _candidate_dates(days=12):
     d=datetime.now()
@@ -78,12 +100,15 @@ def _candidate_dates(days=12):
 
 def _find_latest_market_date(stock):
     last_error=None
-    for ds in _candidate_dates(15):
+    for ds in _candidate_dates(20):
         try:
             tickers=stock.get_etf_ticker_list(ds)
-            if tickers: return ds,list(tickers)
-        except Exception as e: last_error=e
-    raise RuntimeError(f'최근 ETF 기준일을 확인하지 못했습니다: {last_error or "데이터 없음"}')
+            if tickers:
+                return ds,list(tickers)
+        except Exception as e:
+            last_error=e
+    msg=str(last_error or '데이터 없음')
+    raise RuntimeError(f'최근 ETF 기준일을 확인하지 못했습니다: {msg}')
 
 def _pick_col(df,candidates):
     for c in candidates:
@@ -95,7 +120,7 @@ def _num(v):
     except Exception: return None
 
 def collect_krx_etf_snapshot(progress=None,pause=0.05):
-    stock=_import_pykrx(); asof,tickers=_find_latest_market_date(stock)
+    stock,collector_mode=_import_pykrx(); asof,tickers=_find_latest_market_date(stock)
     collected_at=datetime.now().isoformat(timespec='seconds')
     master_rows=[]; holding_rows=[]; failures=[]
     try: ohlcv=stock.get_etf_ohlcv_by_ticker(asof)
@@ -107,7 +132,7 @@ def collect_krx_etf_snapshot(progress=None,pause=0.05):
             name=stock.get_etf_ticker_name(ticker) or ticker
             turnover=None
             if not ohlcv.empty and ticker in ohlcv.index and '거래대금' in ohlcv.columns: turnover=_num(ohlcv.loc[ticker,'거래대금'])
-            pdf=stock.get_etf_portfolio_deposit_file(ticker,asof)
+            pdf=stock.get_etf_portfolio_deposit_file(asof,ticker)
             if pdf is None or pdf.empty: raise RuntimeError('PDF 구성종목이 비어 있음')
             d=pdf.reset_index().copy()
             code_col=_pick_col(d,['티커','ticker','종목코드','index']) or d.columns[0]
@@ -138,7 +163,7 @@ def collect_krx_etf_snapshot(progress=None,pause=0.05):
     if master.empty or holdings.empty: raise RuntimeError('수집 결과가 비어 있어 기존 DB를 변경하지 않았습니다.')
     mt=MASTER_FILE.with_suffix('.tmp'); ht=HOLDINGS_FILE.with_suffix('.tmp')
     master.to_csv(mt,index=False,encoding='utf-8-sig'); holdings.to_csv(ht,index=False,encoding='utf-8-sig'); mt.replace(MASTER_FILE); ht.replace(HOLDINGS_FILE)
-    status={'as_of':asof,'collected_at':collected_at,'total_etfs':total,'success_etfs':len(master),'failed_etfs':len(failures),'holding_rows':len(holdings),'failures':failures,'source':'KRX Data Marketplace / PDF (Portfolio Deposit File)'}
+    status={'as_of':asof,'collected_at':collected_at,'total_etfs':total,'success_etfs':len(master),'failed_etfs':len(failures),'holding_rows':len(holdings),'failures':failures,'source':f'KRX Data Marketplace / PDF (Portfolio Deposit File) · {collector_mode}'}
     STATUS_FILE.write_text(json.dumps(status,ensure_ascii=False,indent=2),encoding='utf-8')
     return master,holdings,status
 
@@ -158,11 +183,26 @@ if 'etf_master' not in st.session_state or 'etf_holdings' not in st.session_stat
     st.session_state.etf_holdings=_h
     st.session_state.collection_status=_status
 
+st.subheader('🔐 KRX 데이터 로그인')
+st.caption('KRX ETF/PDF 실데이터 수집용 로그인입니다. 최신 pykrx가 이 ID/PW로 KRX 로그인 세션을 자동 관리합니다.')
+_c1,_c2=st.columns(2)
+with _c1:
+    _kid=st.text_input('KRX ID',value=_secret_or_env('KRX_ID'),key='_krx_id_input')
+with _c2:
+    _kpw=st.text_input('KRX 비밀번호',value=_secret_or_env('KRX_PW'),type='password',key='_krx_pw_input')
+if _kid: os.environ['KRX_ID']=_kid.strip()
+if _kpw: os.environ['KRX_PW']=_kpw
+st.caption('Streamlit Cloud에서는 Secrets에 KRX_ID와 KRX_PW를 저장할 수 있습니다. 별도 pykrxauth 설치는 필요하지 않습니다.')
+st.divider()
+
 st.subheader('🔄 국내 ETF 실제 데이터 수집')
 _u1,_u2=st.columns([1,1.7])
 with _u1:
     if st.button('KRX ETF 구성종목 DB 업데이트',type='primary',use_container_width=True):
-        bar=st.progress(0,text='KRX ETF 목록을 확인하는 중...')
+        if not (_secret_or_env('KRX_ID') and _secret_or_env('KRX_PW')):
+            st.error('위에 KRX ID와 비밀번호를 먼저 입력해 주세요.')
+            st.stop()
+        bar=st.progress(0,text='KRX 로그인 및 ETF 목록을 확인하는 중...')
         def _progress(i,total,ticker,failed):
             bar.progress(min(i/max(total,1),1.0),text=f'{i:,}/{total:,} · {ticker} · 실패 {failed:,}건')
         try:
