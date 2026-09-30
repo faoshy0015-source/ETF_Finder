@@ -1,9 +1,11 @@
 import streamlit as st
 import os
 import re
+import requests
 import sqlite3
 import pandas as pd
 from datetime import datetime, timedelta
+from html.parser import HTMLParser
 
 st.set_page_config(page_title='ETF Finder', page_icon='🧭', layout='wide')
 
@@ -1346,10 +1348,291 @@ def _set_selected_etf(etf_code,etf_name='',source=''):
     st.session_state['selected_etf_source']=str(source or '')
 
 
+
+class _ETFHTMLTableParser(HTMLParser):
+    """외부 ETF 구성종목 페이지의 HTML 표를 표준 라이브러리만으로 읽는 간단 파서."""
+    def __init__(self):
+        super().__init__()
+        self.tables=[]
+        self._in_table=False
+        self._in_row=False
+        self._in_cell=False
+        self._table=[]
+        self._row=[]
+        self._cell=[]
+
+    def handle_starttag(self,tag,attrs):
+        tag=tag.lower()
+        if tag=='table':
+            self._in_table=True
+            self._table=[]
+        elif self._in_table and tag=='tr':
+            self._in_row=True
+            self._row=[]
+        elif self._in_row and tag in ('td','th'):
+            self._in_cell=True
+            self._cell=[]
+        elif self._in_cell and tag=='br':
+            self._cell.append(' ')
+
+    def handle_data(self,data):
+        if self._in_cell:
+            self._cell.append(data)
+
+    def handle_endtag(self,tag):
+        tag=tag.lower()
+        if self._in_cell and tag in ('td','th'):
+            value=' '.join(''.join(self._cell).split())
+            self._row.append(value)
+            self._in_cell=False
+            self._cell=[]
+        elif self._in_row and tag=='tr':
+            if any(str(x).strip() for x in self._row):
+                self._table.append(self._row)
+            self._in_row=False
+            self._row=[]
+        elif self._in_table and tag=='table':
+            if self._table:
+                self.tables.append(self._table)
+            self._in_table=False
+            self._table=[]
+
+
+def _parse_weight_number(value):
+    s=str(value or '').replace(',','').replace('%','').strip()
+    if not s or s in ('-','--','nan','None'):
+        return None
+    m=re.search(r'-?\d+(?:\.\d+)?',s)
+    if not m:
+        return None
+    try:
+        return float(m.group())
+    except Exception:
+        return None
+
+
+def _clean_external_holding_name(value):
+    s=' '.join(str(value or '').split())
+    # FunETF 등에서 "한글명/English Name (TICKER)" 형식이면 표시명을 조금 정리
+    if '/' in s:
+        left,right=s.split('/',1)
+        if right.strip():
+            s=right.strip()
+    s=re.sub(r'\s*\([A-Z0-9.\-]+\)\s*$','',s).strip()
+    return s
+
+
+def _extract_holdings_from_html(html_text,source_label):
+    parser=_ETFHTMLTableParser()
+    parser.feed(html_text or '')
+
+    candidates=[]
+
+    for table in parser.tables:
+        header_idx=None
+        name_idx=None
+        weight_idx=None
+
+        for i,row in enumerate(table[:8]):
+            norm=[re.sub(r'\s+','',str(x)).lower() for x in row]
+            for j,cell in enumerate(norm):
+                if name_idx is None and ('종목명' in cell or cell in ('name','holding','holdings')):
+                    name_idx=j
+                if weight_idx is None and ('비중' in cell or 'weight' in cell):
+                    weight_idx=j
+            if name_idx is not None and weight_idx is not None:
+                header_idx=i
+                break
+
+        if header_idx is None:
+            continue
+
+        rows=[]
+        for row in table[header_idx+1:]:
+            if max(name_idx,weight_idx)>=len(row):
+                continue
+            name=_clean_external_holding_name(row[name_idx])
+            weight=_parse_weight_number(row[weight_idx])
+
+            if not name or weight is None:
+                continue
+            if weight<0 or weight>100:
+                continue
+
+            # 현금/선물환은 주요 주식 구성종목 표에서 제외
+            name_n=_norm_theme_text(name)
+            if any(x in name_n for x in [
+                '설정현금액','원화현금','현금','cash',
+                '외국환포워드','fxfwd','선물환'
+            ]):
+                continue
+
+            rows.append({
+                'holding_name':name,
+                'weight':float(weight),
+                'source':source_label
+            })
+
+        if rows:
+            df=pd.DataFrame(rows)
+            df=df.drop_duplicates(subset=['holding_name'],keep='first')
+            df=df.sort_values('weight',ascending=False).reset_index(drop=True)
+            candidates.append(df)
+
+    if not candidates:
+        return pd.DataFrame(columns=['holding_name','weight','source'])
+
+    # 행이 가장 많은 유효 표를 우선 사용
+    candidates.sort(key=lambda x:(len(x),x['weight'].sum()),reverse=True)
+    return candidates[0]
+
+
+def _extract_basis_date_from_html(html_text):
+    plain=re.sub(r'<[^>]+>',' ',html_text or '')
+    plain=' '.join(plain.split())
+
+    patterns=[
+        r'(\d{4})[.\-/년]\s*(\d{1,2})[.\-/월]\s*(\d{1,2})일?\s*기준',
+        r'(\d{2})[.\-/]\s*(\d{1,2})[.\-/]\s*(\d{1,2})\s*기준',
+    ]
+    for p in patterns:
+        m=re.search(p,plain)
+        if not m:
+            continue
+        y,mn,d=m.groups()
+        if len(y)==2:
+            y='20'+y
+        try:
+            return f'{int(y):04d}{int(mn):02d}{int(d):02d}'
+        except Exception:
+            pass
+    return ''
+
+
+@st.cache_data(ttl=21600,show_spinner=False)
+def get_foreign_etf_weights(etf_code,etf_name):
+    """
+    KRX PDF가 해외 구성종목 비중을 0으로 제공하는 ETF에 한해
+    선택한 ETF의 실제 공개 비중 데이터를 보완 조회한다.
+    앱 전체 DB를 다시 수집하지 않는다.
+    """
+    code=str(etf_code).zfill(6)
+    name=str(etf_name or '')
+    isin=''
+
+    try:
+        stock,_mode=_import_pykrx()
+        isin=str(stock.get_etf_isin(code) or '').strip()
+    except Exception:
+        isin=''
+
+    headers={
+        'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                     'AppleWebKit/537.36 Chrome/130 Safari/537.36',
+        'Accept-Language':'ko-KR,ko;q=0.9,en;q=0.7'
+    }
+
+    sources=[]
+
+    # TIGER는 운용사 공개 페이지를 우선 시도
+    if isin and name.upper().startswith('TIGER'):
+        sources.append((
+            f'https://www.tigeretf.com/ko/product/search/detail/index.do?ksdFund={isin}&otherPage=asset',
+            'TIGER 운용사 공개 구성종목'
+        ))
+
+    # 국내 상장 ETF 전반에 대해 ISIN 기반 공개 구성종목 페이지 보완
+    if isin:
+        sources.append((
+            f'https://www.funetf.co.kr/product/etf/view/{isin}',
+            'FunETF 공개 구성종목'
+        ))
+
+    # 종목코드 기반 보조 페이지
+    sources.append((
+        f'https://etf.zeroin.co.kr/etf/{code}',
+        'KG제로인 공개 구성종목'
+    ))
+
+    errors=[]
+    best=pd.DataFrame(columns=['holding_name','weight','source'])
+    best_date=''
+
+    for url,label in sources:
+        try:
+            r=requests.get(url,headers=headers,timeout=12)
+            r.raise_for_status()
+
+            df=_extract_holdings_from_html(r.text,label)
+            if not df.empty:
+                basis=_extract_basis_date_from_html(r.text)
+
+                # 더 많은 유효 구성종목을 주는 출처를 채택.
+                if len(df)>len(best):
+                    best=df.copy()
+                    best_date=basis
+
+                # 20개 이상 확보되면 상세 표시 용도로 충분하므로 종료
+                if len(best)>=20:
+                    break
+        except Exception as e:
+            errors.append(f'{label}: {e}')
+
+    return {
+        'holdings':best.to_dict('records') if not best.empty else [],
+        'basis_date':best_date,
+        'error':' | '.join(errors[-3:])
+    }
+
+
+def _weights_are_missing(holdings):
+    if holdings is None or holdings.empty or 'weight' not in holdings.columns:
+        return True
+    w=pd.to_numeric(holdings['weight'],errors='coerce').fillna(0.0)
+    return bool(len(w)>0 and float(w.max())<=0.0)
+
+
+def _prepare_holdings_for_detail(code,etf_name,local_holdings):
+    """
+    국내 ETF: 로컬 KRX 비중 그대로 사용
+    해외 ETF 등 KRX 비중이 모두 0: 공개 구성종목 데이터로 표시용 비중 보완
+    """
+    if local_holdings is None:
+        local_holdings=pd.DataFrame(columns=HOLDING_COLUMNS)
+
+    if not _weights_are_missing(local_holdings):
+        return local_holdings.copy(),'KRX 로컬 DB','',False
+
+    fallback=get_foreign_etf_weights(code,etf_name)
+    rows=fallback.get('holdings') or []
+
+    if rows:
+        ext=pd.DataFrame(rows)
+        ext['holding_code']=''
+        ext['quantity']=None
+        ext['as_of']=fallback.get('basis_date') or ''
+        ext['source']=ext.get('source','해외 ETF 비중 보완')
+        cols=[
+            'holding_code','holding_name','weight',
+            'quantity','as_of','source'
+        ]
+        for c in cols:
+            if c not in ext.columns:
+                ext[c]=None
+        ext['weight']=pd.to_numeric(ext['weight'],errors='coerce')
+        ext=ext.dropna(subset=['weight'])
+        ext=ext[ext['weight']>0]
+        ext=ext.sort_values('weight',ascending=False).reset_index(drop=True)
+
+        source=str(ext['source'].iloc[0]) if not ext.empty else '해외 ETF 공개 구성종목'
+        return ext[cols],source,fallback.get('basis_date') or '',True
+
+    return local_holdings.copy(),'KRX PDF · 해외종목 비중 미제공','',True
+
 def render_etf_detail(etf_code,key_prefix='detail'):
     code=str(etf_code).zfill(6)
     master_row=get_etf_master_local(code,db_token())
-    holdings=get_etf_holdings_local(code,db_token())
+    local_holdings=get_etf_holdings_local(code,db_token())
 
     etf_name=str(
         master_row.get('etf_name')
@@ -1357,19 +1640,31 @@ def render_etf_detail(etf_code,key_prefix='detail'):
         or code
     )
 
+    holdings,holding_source,fallback_basis_date,used_fallback=_prepare_holdings_for_detail(
+        code,
+        etf_name,
+        local_holdings
+    )
+
     st.markdown('---')
     st.subheader(f'📈 {etf_name} · {code}')
     st.caption('선택한 ETF의 가격차트와 로컬 DB 구성종목입니다.')
 
     basis_date='-'
-    if master_row.get('as_of'):
+    if fallback_basis_date:
+        basis_date=str(fallback_basis_date)
+    elif master_row.get('as_of'):
         basis_date=str(master_row.get('as_of'))
     elif not holdings.empty and 'as_of' in holdings.columns:
         basis_date=str(holdings['as_of'].iloc[0])
 
+    local_count=len(local_holdings) if local_holdings is not None else 0
+    display_count=len(holdings)
+    count_text=f'{local_count:,}개' if local_count else f'{display_count:,}개'
+
     info_cols=st.columns(4)
     info_cols[0].metric('ETF 코드',code)
-    info_cols[1].metric('구성종목',f'{len(holdings):,}개')
+    info_cols[1].metric('구성종목',count_text)
     info_cols[2].metric('구성 기준일',basis_date)
     info_cols[3].metric('추종지수',str(master_row.get('index_name') or '-')[:28])
 
@@ -1421,19 +1716,38 @@ def render_etf_detail(etf_code,key_prefix='detail'):
     with holding_col:
         st.markdown('#### 주요 구성종목')
 
+        if used_fallback and not holdings.empty and pd.to_numeric(
+            holdings.get('weight',pd.Series(dtype=float)),
+            errors='coerce'
+        ).fillna(0).max()>0:
+            st.caption(f'비중 출처: {holding_source}')
+        elif used_fallback:
+            st.info(
+                '이 해외 ETF는 KRX PDF에서 구성종목명은 제공되지만 비중은 0으로 제공됩니다. '
+                '외부 공개 비중 보완 조회도 실패하여 0.00%를 실제 비중으로 표시하지 않습니다.'
+            )
+
         if holdings.empty:
             st.info('현재 로컬 DB에 이 ETF의 구성종목 데이터가 없습니다.')
         else:
-            # 편입비중 높은 순으로 정렬
-            holdings=holdings.sort_values(
-                'weight',
-                ascending=False,
-                na_position='last'
-            ).reset_index(drop=True)
+            holdings=holdings.copy()
+            holdings['weight']=pd.to_numeric(
+                holdings.get('weight',0),
+                errors='coerce'
+            )
 
-            top=holdings.head(10).copy()
+            valid_weight=holdings['weight'].fillna(0)>0
 
-            if 'weight' in top.columns:
+            if valid_weight.any():
+                # 실제 양수 비중이 확보된 경우에만 비중 차트/숫자를 표시
+                holdings=holdings.sort_values(
+                    'weight',
+                    ascending=False,
+                    na_position='last'
+                ).reset_index(drop=True)
+
+                top=holdings[holdings['weight']>0].head(10).copy()
+
                 chart_top=top[['holding_name','weight']].copy()
                 chart_top=chart_top[
                     chart_top['holding_name'].fillna('').astype(str).str.len()>0
@@ -1448,50 +1762,89 @@ def render_etf_detail(etf_code,key_prefix='detail'):
                     )
                     st.caption('상위 구성종목 편입비중(%) · 비중 높은 순')
 
-            # 좁은 상세영역에서도 바로 읽히도록 종목명 + 비중만 표시
-            holding_show=holdings[['holding_name','weight']].copy().rename(columns={
-                'holding_name':'구성종목',
-                'weight':'비중(%)'
-            })
+                holding_show=holdings.loc[
+                    holdings['weight']>0,
+                    ['holding_name','weight']
+                ].copy().rename(columns={
+                    'holding_name':'구성종목',
+                    'weight':'비중(%)'
+                })
 
-            st.dataframe(
-                holding_show,
-                use_container_width=True,
-                hide_index=True,
-                height=420,
-                column_config={
-                    '구성종목':st.column_config.TextColumn(
-                        '구성종목',
-                        width='medium'
-                    ),
-                    '비중(%)':st.column_config.NumberColumn(
-                        '비중(%)',
-                        format='%.2f%%',
-                        width='small'
-                    )
-                }
-            )
+                st.dataframe(
+                    holding_show,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=420,
+                    column_config={
+                        '구성종목':st.column_config.TextColumn(
+                            '구성종목',
+                            width='medium'
+                        ),
+                        '비중(%)':st.column_config.NumberColumn(
+                            '비중(%)',
+                            format='%.2f%%',
+                            width='small'
+                        )
+                    }
+                )
 
+            else:
+                # KRX 해외 ETF PDF의 0.0은 실제 0%가 아니므로 비중 숫자를 숨긴다.
+                name_only=holdings[['holding_name']].copy()
+                name_only=name_only[
+                    name_only['holding_name'].fillna('').astype(str).str.len()>0
+                ]
+                name_only=name_only.rename(columns={'holding_name':'구성종목'})
+
+                st.dataframe(
+                    name_only,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=420,
+                    column_config={
+                        '구성종목':st.column_config.TextColumn(
+                            '구성종목',
+                            width='large'
+                        )
+                    }
+                )
+                st.caption('KRX 원자료에서 해외 구성종목 비중이 제공되지 않아 종목명만 표시합니다.')
+
+            # 원래 KRX 로컬 구성종목 전체도 확인 가능
             with st.expander('전체 구성종목 상세정보'):
+                source_df=local_holdings.copy() if not local_holdings.empty else holdings.copy()
+
                 detail_cols=[
                     c for c in [
                         'holding_name','holding_code','weight','quantity','as_of'
-                    ] if c in holdings.columns
+                    ] if c in source_df.columns
                 ]
-                detail_show=holdings[detail_cols].copy().rename(columns={
+                detail_show=source_df[detail_cols].copy().rename(columns={
                     'holding_name':'구성종목',
                     'holding_code':'종목코드',
                     'weight':'비중(%)',
                     'quantity':'수량',
                     'as_of':'기준일'
                 })
+
+                # 전부 0인 해외 ETF는 오해 방지를 위해 비중 칼럼 제거
+                if (
+                    '비중(%)' in detail_show.columns
+                    and not detail_show.empty
+                    and pd.to_numeric(
+                        detail_show['비중(%)'],
+                        errors='coerce'
+                    ).fillna(0).max()<=0
+                ):
+                    detail_show=detail_show.drop(columns=['비중(%)'])
+
                 st.dataframe(
                     detail_show,
                     use_container_width=True,
                     hide_index=True,
                     column_config={
                         '비중(%)':st.column_config.NumberColumn(format='%.2f%%')
-                    }
+                    } if '비중(%)' in detail_show.columns else None
                 )
 
 
