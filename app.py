@@ -1,8 +1,5 @@
 import streamlit as st
 import os
-import sys
-import subprocess
-import importlib
 import sqlite3
 import pandas as pd
 from datetime import datetime, timedelta
@@ -254,68 +251,32 @@ def _secret_or_env(name):
     return os.getenv(name, '').strip()
 
 def _import_pykrx():
-    # KRX 로그인 정보는 .streamlit/secrets.toml 또는 환경변수에서 자동 사용.
+    # KRX 로그인 정보는 .streamlit/secrets.toml 또는 Streamlit Cloud Secrets에서 자동 사용.
     krx_id=_secret_or_env('KRX_ID')
     krx_pw=_secret_or_env('KRX_PW')
     if not krx_id or not krx_pw:
         raise RuntimeError(
-            '.streamlit/secrets.toml에 KRX_ID와 KRX_PW가 없습니다.'
+            'KRX 로그인 정보가 없습니다. '
+            '로컬은 .streamlit/secrets.toml, Streamlit Cloud는 App Settings → Secrets에 '
+            'KRX_ID와 KRX_PW를 저장해 주세요.'
         )
 
     os.environ['KRX_ID']=krx_id
     os.environ['KRX_PW']=krx_pw
 
-    # 1) 이미 설치되어 있으면 즉시 사용.
     try:
         import pykrx
         from pykrx import stock
         ver=getattr(pykrx,'__version__',getattr(pykrx,'version',''))
         return stock, f'pykrx {ver}'.strip()
-    except ModuleNotFoundError:
-        pass
-    except Exception as first_error:
-        # 설치는 되어 있지만 import 중 의존성 문제가 난 경우에도 한 번 복구 시도.
-        import_error=first_error
-    else:
-        import_error=None
-
-    # 2) 현재 Streamlit을 실행 중인 같은 Python에 자동 설치/업데이트.
-    try:
-        cmd=[
-            sys.executable, '-m', 'pip', 'install',
-            '--disable-pip-version-check', '--upgrade', 'pykrx'
-        ]
-        result=subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=180
-        )
-        if result.returncode != 0:
-            detail=(result.stderr or result.stdout or '').strip()
-            raise RuntimeError(
-                'pykrx 자동 설치에 실패했습니다. '
-                f'실행 Python: {sys.executable} / 설치 오류: {detail[-1200:]}'
-            )
-
-        importlib.invalidate_caches()
-
-        # 같은 프로세스에서 실패 흔적이 남아 있을 수 있어 관련 모듈만 제거 후 재import.
-        for name in list(sys.modules):
-            if name == 'pykrx' or name.startswith('pykrx.'):
-                sys.modules.pop(name, None)
-
-        import pykrx
-        from pykrx import stock
-        ver=getattr(pykrx,'__version__',getattr(pykrx,'version',''))
-        return stock, f'pykrx {ver} (자동 설치/업데이트)'.strip()
-
-    except Exception as e:
+    except ModuleNotFoundError as e:
         raise RuntimeError(
-            'pykrx 자동 준비에 실패했습니다. '
-            f'현재 Streamlit 실행 Python은 {sys.executable} 입니다. '
-            f'상세 오류: {e}'
+            'pykrx가 현재 배포 환경에 설치되어 있지 않습니다. '
+            'Streamlit Cloud에서는 실행 중 pip 설치가 아니라 '
+            'app.py와 같은 폴더의 requirements.txt에 pykrx를 넣어 배포해야 합니다.'
         ) from e
+    except Exception as e:
+        raise RuntimeError(f'pykrx 로딩 실패: {e}') from e
 
 def _candidate_dates(days=12):
     d=datetime.now()
@@ -753,7 +714,7 @@ else:
 
 _krx_ready=bool(_secret_or_env('KRX_ID') and _secret_or_env('KRX_PW'))
 if _krx_ready:
-    st.caption('🔐 KRX 로그인 정보: .streamlit/secrets.toml 자동 사용 · pykrx가 없으면 앱이 자동 설치')
+    st.caption('🔐 KRX 로그인 정보: Secrets 자동 사용 · pykrx는 requirements.txt에서 배포 시 설치')
 else:
     st.warning('KRX 업데이트용 Secrets가 없습니다. .streamlit/secrets.toml에 KRX_ID와 KRX_PW를 저장해 주세요.')
 
